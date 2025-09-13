@@ -1,10 +1,37 @@
 import re, json, base64, tempfile, subprocess
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from time import time
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Creator Transcript Fetcher", version="1.0.0")
+# ------------------------------
+# In-memory file store (short-lived)
+# ------------------------------
+STORE_TTL_SECONDS = 60 * 60  # 1 hour (was 15 mins)
+
+STORE: dict[str, dict] = {}  # fid -> {"bytes": b, "mime": str, "name": str, "exp": float}
+
+def put_file(name: str, mime: str, b: bytes) -> str:
+    fid = uuid4().hex
+    STORE[fid] = {"bytes": b, "mime": mime, "name": name, "exp": time() + STORE_TTL_SECONDS}
+    return fid
+
+def get_file(fid: str):
+    item = STORE.get(fid)
+    if not item:
+        return None
+    if item["exp"] < time():
+        STORE.pop(fid, None)
+        return None
+    return item
+
+# ------------------------------
+# App + models
+# ------------------------------
+app = FastAPI(title="Creator Transcript Fetcher", version="1.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,14 +45,11 @@ class Req(BaseModel):
     langs: str = "en,en-US,en-GB"
     keep_timestamps: bool = False
 
+# ------------------------------
+# Helpers
+# ------------------------------
 def run(cmd, cwd: Path | None = None) -> str:
-    """Run a shell command; optionally inside working directory `cwd`."""
-    p = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=str(cwd) if cwd else None,
-    )
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd) if cwd else None)
     if p.returncode != 0:
         raise RuntimeError(p.stderr or p.stdout)
     return p.stdout
@@ -46,11 +70,8 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     blocks = re.split(r"\n\s*\n", raw.strip())
     lines = []
     for blk in blocks:
-        # remove index (e.g., "123")
-        blk = re.sub(r"^\s*\d+\s*\n", "", blk)
-        # first timestamp for optional prefix
+        blk = re.sub(r"^\s*\d+\s*\n", "", blk)  # remove index
         m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
-        # drop the timestamp line
         text = re.sub(
             r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
             "",
@@ -62,7 +83,7 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
         lines.append(f"{m.group(1)} {text}" if (keep_ts and m) else text)
 
     out = "\n".join(lines) if keep_ts else " ".join(lines)
-    # de-duplicate immediate word repeats and tidy spacing
+    # de-dup immediate repeats + tidy punctuation spacing
     out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
@@ -75,8 +96,20 @@ def as_data_url(mime: str, content: bytes | None, b64: bool = False) -> str:
     from urllib.parse import quote
     return f"data:{mime},{quote(content.decode('utf-8'))}"
 
+# ------------------------------
+# API
+# ------------------------------
+@app.get("/file/{fid}")
+def download_file(fid: str):
+    """Short-lived HTTP download endpoint for GPT UI."""
+    item = get_file(fid)
+    if not item:
+        raise HTTPException(status_code=404, detail="File expired or not found.")
+    headers = {"Content-Disposition": f'attachment; filename="{item["name"]}"'}
+    return Response(content=item["bytes"], media_type=item["mime"], headers=headers)
+
 @app.post("/transcript")
-def transcript(req: Req):
+def transcript(req: Req, request: Request):
     url = req.url_or_id if req.url_or_id.startswith("http") else f"https://www.youtube.com/watch?v={req.url_or_id}"
     vid = video_id(url)
 
@@ -92,7 +125,7 @@ def transcript(req: Req):
             published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
         duration_s = int(meta.get("duration") or 0)
 
-        # 2) download subtitles into temp folder (try manual then auto)
+        # 2) subtitles (manual first, then auto)
         base = [
             "yt-dlp",
             "--skip-download",
@@ -113,7 +146,7 @@ def transcript(req: Req):
         if not ok:
             raise HTTPException(status_code=404, detail="No captions available for this video.")
 
-        # 3) ensure .srt exists (convert from .vtt if needed)
+        # 3) ensure .srt exists (convert vtt -> srt if needed)
         srt = next(iter(wd.glob(f"{vid}*.srt")), None)
         vtt = None if srt else next(iter(wd.glob(f"{vid}*.vtt")), None)
         if not srt and vtt:
@@ -122,24 +155,23 @@ def transcript(req: Req):
         if not srt or not srt.exists():
             raise HTTPException(status_code=404, detail="Failed to obtain subtitles.")
 
-        # 4) clean transcript text
+        # 4) clean transcript
         txt = clean_srt_to_text(srt, keep_ts=req.keep_timestamps)
         txt_bytes = txt.encode("utf-8")
         srt_bytes = srt.read_bytes()
 
-        # 5) optional PDF (ASCII-safe for fpdf 1.x)
+        # 5) PDF (ASCII-safe for fpdf 1.x)
         pdf_bytes = None
         try:
             from fpdf import FPDF
 
             def to_latin1(s: str) -> str:
-                # drop characters fpdf 1.x can't encode
                 return s.encode("latin-1", "ignore").decode("latin-1")
 
             pdf = FPDF()
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-            pdf.set_font("Helvetica", size=12)  # built-in core font
+            pdf.set_font("Helvetica", size=12)
 
             header = f"{title} — {channel}\n{url}\n\n"
             for line in (header + txt).split("\n"):
@@ -151,10 +183,17 @@ def transcript(req: Req):
         except Exception:
             pdf_bytes = None
 
-        # 6) data URLs for downloads
+        # 6) Data URLs (good in Swagger) + short-lived HTTP links (work in GPT)
         txt_url = as_data_url("text/plain;charset=utf-8", txt_bytes)
         srt_url = as_data_url("text/plain;charset=utf-8", srt_bytes)
-        pdf_url = as_data_url("application/pdf", pdf_bytes, b64=True)
+        pdf_url = as_data_url("application/pdf", pdf_bytes, b64=True) if pdf_bytes else ""
+
+        base_url = str(request.base_url).rstrip("/")
+        txt_http_url = f"{base_url}/file/{put_file(f'{vid}.txt', 'text/plain; charset=utf-8', txt_bytes)}"
+        srt_http_url = f"{base_url}/file/{put_file(f'{vid}.srt', 'text/plain; charset=utf-8', srt_bytes)}"
+        pdf_http_url = ""
+        if pdf_bytes:
+            pdf_http_url = f"{base_url}/file/{put_file(f'transcript_{vid}.pdf', 'application/pdf', pdf_bytes)}"
 
         preview = txt[:2500]
         return {
@@ -165,7 +204,13 @@ def transcript(req: Req):
             "video_id": vid,
             "preview_text": preview,
             "truncated": len(txt) > len(preview),
+            # Data URLs (Swagger)
             "txt_url": txt_url,
             "srt_url": srt_url,
             "pdf_url": pdf_url,
+            # HTTP links (GPT UI)
+            "txt_http_url": txt_http_url,
+            "srt_http_url": srt_http_url,
+            "pdf_http_url": pdf_http_url,
+            "links_expire_in_seconds": STORE_TTL_SECONDS
         }
