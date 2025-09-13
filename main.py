@@ -145,31 +145,3 @@ def transcript(req: Req):
             "pdf_url": pdf_url,
         }
 ```
-
----
-
-## `requirements.txt`
-
-```text
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-yt-dlp==2025.01.12
-fpdf==1.7.2
-```
-
----
-
-## `Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-ENV PORT=8000
-EXPOSE 8000
-CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
-```
