@@ -5,6 +5,7 @@ import base64
 import tempfile
 import subprocess
 import time
+import unicodedata
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -17,15 +18,17 @@ from starlette.responses import Response
 # ------------------------------
 # In-memory file store (expiring)
 # ------------------------------
-FILE_TTL_SECONDS = 3600  # 1 hour (match what your instructions say)
-_file_store: Dict[str, Dict[str, Any]] = {}  # token -> {content, mime, exp}
+# CHANGED: default TTL -> 24h, and allow env override
+FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "86400"))  # 24 hours
+_file_store: Dict[str, Dict[str, Any]] = {}  # token -> {content, mime, exp, filename}
 
-def _store_file(content: bytes, mime: str) -> str:
+def _store_file(content: bytes, mime: str, filename: str) -> str:
     token = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
     _file_store[token] = {
         "content": content,
         "mime": mime,
         "exp": time.time() + FILE_TTL_SECONDS,
+        "filename": filename,
     }
     return token
 
@@ -105,7 +108,7 @@ def get_meta_with_ytdlp(url: str, workdir: Path, debug: List[str]) -> Dict[str, 
 
 def clean_srt_to_text(srt_text: str, keep_ts: bool) -> str:
     """
-    Very simple SRT cleaner for demo: removes index/timestamp lines.
+    Simple SRT cleaner: removes index/timestamp lines.
     Keeps timestamps if keep_ts=True (first timestamp per block).
     """
     blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
@@ -113,11 +116,8 @@ def clean_srt_to_text(srt_text: str, keep_ts: bool) -> str:
     ts_re = re.compile(r"^\s*\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$", re.M)
 
     for blk in blocks:
-        # Drop leading index line if present
-        blk2 = re.sub(r"^\s*\d+\s*\r?\n", "", blk)
-        # Find first timestamp (if any)
+        blk2 = re.sub(r"^\s*\d+\s*\r?\n", "", blk)  # drop index
         ts_match = ts_re.search(blk2)
-        # Remove all timestamp lines
         text = ts_re.sub("", blk2)
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
@@ -169,31 +169,32 @@ def try_subs(url: str, workdir: Path, langs: str, debug: List[str]) -> Tuple[Opt
         attempt_log["attempts"].append(
             {"label": label, "rc": rc, "cmd": " ".join(cmd), "stderr": err[:2000]}
         )
-        # On success, look for any .srt in workdir
         if rc == 0:
             srt_list = list(workdir.glob("*.srt"))
             if srt_list:
-                # Return the most recently modified .srt
                 srt_list.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 return srt_list[0]
         return None
 
-    # 1) try manual subs in requested langs
     p = _run_attempt("manual/requested", "--write-sub", langs)
     if p:
         return p, attempt_log
 
-    # 2) try auto subs in requested langs
     p = _run_attempt("auto/requested", "--write-auto-sub", langs)
     if p:
         return p, attempt_log
 
-    # 3) last resort: wildcard for English variants
     p = _run_attempt("auto/wildcard", "--write-auto-sub", "en,*en*")
     if p:
         return p, attempt_log
 
     return None, attempt_log
+
+# NEW: make text safe for core PDF fonts (latin-1)
+def _pdf_sanitize(s: str) -> str:
+    # Replace non-latin-1 chars with a close ASCII approximation (or drop).
+    normalized = unicodedata.normalize("NFKD", s)
+    return normalized.encode("latin-1", "ignore").decode("latin-1")
 
 # --------------
 # Routes
@@ -201,7 +202,7 @@ def try_subs(url: str, workdir: Path, langs: str, debug: List[str]) -> Tuple[Opt
 @app.get("/health")
 def health():
     _cleanup_files()
-    return {"ok": True, "time": time.time()}
+    return {"ok": True, "time": time.time(), "ttl_seconds": FILE_TTL_SECONDS}
 
 @app.get("/file/{token}")
 def get_file(token: str):
@@ -209,7 +210,12 @@ def get_file(token: str):
     item = _file_store.get(token)
     if not item or item["exp"] < time.time():
         raise HTTPException(status_code=404, detail="File expired or not found.")
-    return Response(content=item["content"], media_type=item["mime"])
+    headers = {
+        "Content-Type": item["mime"],
+        "Content-Disposition": f'attachment; filename="{item["filename"]}"',
+        "Cache-Control": "no-store",
+    }
+    return Response(content=item["content"], media_type=item["mime"], headers=headers)
 
 @app.post("/transcript")
 def transcript(req: Req):
@@ -240,7 +246,6 @@ def transcript(req: Req):
         srt_path, attempts = try_subs(req.url_or_id, wd, req.langs, debug)
 
         if not srt_path or not srt_path.exists():
-            # Build a helpful error including yt-dlp attempt logs and timedtext probe
             detail = {
                 "message": "Failed to obtain subtitles.",
                 "video_id_extracted": vid,
@@ -256,32 +261,46 @@ def transcript(req: Req):
         txt_text = clean_srt_to_text(srt_text, keep_ts=req.keep_timestamps)
         txt_bytes = txt_text.encode("utf-8")
 
-        # Optional PDF
+        # Robust PDF creation (no trimming — paginate & wrap)
         pdf_bytes = b""
         pdf_http_url = ""
+        pdf_error = ""
         try:
-            from fpdf import FPDF
+            from fpdf import FPDF  # core fonts only (latin-1)
             pdf = FPDF()
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-            pdf.set_font("Arial", size=12)
+            pdf.set_font("Helvetica", size=12)  # CHANGED: core font always available
+
             header = f"{title} — {channel}\nhttps://www.youtube.com/watch?v={meta_vid}\n\n"
-            for line in (header + txt_text).split("\n"):
-                pdf.multi_cell(0, 6, line)
+            # Sanitize for latin-1; multi_cell will wrap and paginate automatically.
+            safe_text = _pdf_sanitize(header + txt_text)
+
+            # Write in safe chunks to avoid any weird extremely long line edge cases
+            # (this does NOT trim content—just writes sequentially).
+            for paragraph in safe_text.split("\n"):
+                pdf.multi_cell(0, 6, paragraph)
+
             pdf_path = wd / f"transcript_{meta_vid}.pdf"
             pdf.output(str(pdf_path))
             pdf_bytes = pdf_path.read_bytes()
         except Exception as e:
-            debug.append(f"[pdf] generation failed: {e}")
+            pdf_error = f"{type(e).__name__}: {e}"
+            debug.append(f"[pdf] generation failed: {pdf_error}")
 
-        # Create download tokens
-        txt_token = _store_file(txt_bytes, "text/plain; charset=utf-8")
-        srt_token = _store_file(srt_bytes, "text/plain; charset=utf-8")
+        # Create download tokens (with filenames)
+        # Pick a primary language tag for the filename
+        primary_lang = (req.langs.split(",")[0] or "en").strip().replace("*", "en")
+        txt_filename = f"{meta_vid}_{primary_lang}.txt"
+        srt_filename = f"{meta_vid}_{primary_lang}.srt"
+        pdf_filename = f"transcript_{meta_vid}.pdf"
+
+        txt_token = _store_file(txt_bytes, "text/plain; charset=utf-8", txt_filename)
+        srt_token = _store_file(srt_bytes, "text/plain; charset=utf-8", srt_filename)
         if pdf_bytes:
-            pdf_token = _store_file(pdf_bytes, "application/pdf")
+            pdf_token = _store_file(pdf_bytes, "application/pdf", pdf_filename)
             pdf_http_url = f"/file/{pdf_token}"
 
-        # Always return server-relative links; your GPT will prefix with baseUrl.
         result = {
             "title": title,
             "channel": channel,
@@ -299,8 +318,8 @@ def transcript(req: Req):
                 "extracted_video_id": vid,
                 "timedtext_probe": tt,             # status + length of XML
                 "ytdlp_attempts": attempts["attempts"],  # every command + rc + stderr
-                "workdir": str(wd),
                 "meta_id": meta_vid,
+                "pdf_error": pdf_error,            # NEW: see why PDF would fail (if it does)
             },
         }
         return result
