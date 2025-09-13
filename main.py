@@ -1,4 +1,4 @@
-import os, re, json, base64, tempfile, subprocess
+import re, json, base64, tempfile, subprocess
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -18,8 +18,14 @@ class Req(BaseModel):
     langs: str = "en,en-US,en-GB"
     keep_timestamps: bool = False
 
-def run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd, cwd: Path | None = None) -> str:
+    """Run a shell command; optionally in working directory `cwd`."""
+    p = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(cwd) if cwd else None,
+    )
     if p.returncode != 0:
         raise RuntimeError(p.stderr or p.stdout)
     return p.stdout
@@ -40,8 +46,11 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     blocks = re.split(r"\n\s*\n", raw.strip())
     lines = []
     for blk in blocks:
-        blk = re.sub(r"^\s*\d+\s*\n", "", blk)  # remove index
+        # remove index line like "123"
+        blk = re.sub(r"^\s*\d+\s*\n", "", blk)
+        # extract first timestamp for optional prefix
         m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
+        # remove the timestamp line
         text = re.sub(
             r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
             "",
@@ -50,11 +59,10 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
-        if keep_ts and m:
-            lines.append(f"{m.group(1)} {text}")
-        else:
-            lines.append(text)
+        lines.append(f"{m.group(1)} {text}" if (keep_ts and m) else text)
+
     out = "\n".join(lines) if keep_ts else " ".join(lines)
+    # de-duplicate immediate word repeats and tidy spacing before punctuation
     out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
@@ -84,7 +92,7 @@ def transcript(req: Req):
             published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
         duration_s = int(meta.get("duration") or 0)
 
-        # 2) download subtitles (manual then auto)
+        # 2) download subtitles into temp folder (try manual then auto)
         base = [
             "yt-dlp",
             "--skip-download",
@@ -97,7 +105,7 @@ def transcript(req: Req):
         ok = False
         for mode in ("--write-sub", "--write-auto-sub"):
             try:
-                run(base[:1] + [mode] + base[1:])
+                run(base[:1] + [mode] + base[1:], cwd=wd)
                 ok = True
                 break
             except Exception:
@@ -105,16 +113,16 @@ def transcript(req: Req):
         if not ok:
             raise HTTPException(status_code=404, detail="No captions available for this video.")
 
-        # 3) ensure .srt exists (convert from .vtt if needed)
+        # 3) ensure .srt exists (convert from .vtt if needed) — in temp folder
         srt = next(iter(wd.glob(f"{vid}*.srt")), None)
         vtt = None if srt else next(iter(wd.glob(f"{vid}*.vtt")), None)
         if not srt and vtt:
-            run(["ffmpeg", "-y", "-i", str(vtt), str(vtt.with_suffix(".srt"))])
+            run(["ffmpeg", "-y", "-i", str(vtt), str(vtt.with_suffix(".srt"))], cwd=wd)
             srt = vtt.with_suffix(".srt")
         if not srt or not srt.exists():
             raise HTTPException(status_code=404, detail="Failed to obtain subtitles.")
 
-        # 4) clean to text
+        # 4) clean transcript text
         txt = clean_srt_to_text(srt, keep_ts=req.keep_timestamps)
         txt_bytes = txt.encode("utf-8")
         srt_bytes = srt.read_bytes()
@@ -136,7 +144,7 @@ def transcript(req: Req):
         except Exception:
             pdf_bytes = None
 
-        # 6) build data URLs
+        # 6) data URLs for downloads
         txt_url = as_data_url("text/plain;charset=utf-8", txt_bytes)
         srt_url = as_data_url("text/plain;charset=utf-8", srt_bytes)
         pdf_url = as_data_url("application/pdf", pdf_bytes, b64=True)
