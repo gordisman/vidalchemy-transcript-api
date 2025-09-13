@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install ffmpeg for subtitle conversion
+# Install ffmpeg (for VTT→SRT) and keep the image small
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
