@@ -19,7 +19,7 @@ class Req(BaseModel):
     keep_timestamps: bool = False
 
 def run(cmd, cwd: Path | None = None) -> str:
-    """Run a shell command; optionally in working directory `cwd`."""
+    """Run a shell command; optionally inside working directory `cwd`."""
     p = subprocess.run(
         cmd,
         capture_output=True,
@@ -46,11 +46,11 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     blocks = re.split(r"\n\s*\n", raw.strip())
     lines = []
     for blk in blocks:
-        # remove index line like "123"
+        # remove index (e.g., "123")
         blk = re.sub(r"^\s*\d+\s*\n", "", blk)
-        # extract first timestamp for optional prefix
+        # first timestamp for optional prefix
         m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
-        # remove the timestamp line
+        # drop the timestamp line
         text = re.sub(
             r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
             "",
@@ -62,7 +62,7 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
         lines.append(f"{m.group(1)} {text}" if (keep_ts and m) else text)
 
     out = "\n".join(lines) if keep_ts else " ".join(lines)
-    # de-duplicate immediate word repeats and tidy spacing before punctuation
+    # de-duplicate immediate word repeats and tidy spacing
     out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
@@ -113,7 +113,7 @@ def transcript(req: Req):
         if not ok:
             raise HTTPException(status_code=404, detail="No captions available for this video.")
 
-        # 3) ensure .srt exists (convert from .vtt if needed) — in temp folder
+        # 3) ensure .srt exists (convert from .vtt if needed)
         srt = next(iter(wd.glob(f"{vid}*.srt")), None)
         vtt = None if srt else next(iter(wd.glob(f"{vid}*.vtt")), None)
         if not srt and vtt:
@@ -127,17 +127,24 @@ def transcript(req: Req):
         txt_bytes = txt.encode("utf-8")
         srt_bytes = srt.read_bytes()
 
-        # 5) optional PDF
+        # 5) optional PDF (ASCII-safe for fpdf 1.x)
         pdf_bytes = None
         try:
             from fpdf import FPDF
+
+            def to_latin1(s: str) -> str:
+                # drop characters fpdf 1.x can't encode
+                return s.encode("latin-1", "ignore").decode("latin-1")
+
             pdf = FPDF()
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-            pdf.set_font("Arial", size=12)
+            pdf.set_font("Helvetica", size=12)  # built-in core font
+
             header = f"{title} — {channel}\n{url}\n\n"
             for line in (header + txt).split("\n"):
-                pdf.multi_cell(0, 6, line)
+                pdf.multi_cell(0, 6, to_latin1(line))
+
             pdf_path = wd / f"transcript_{vid}.pdf"
             pdf.output(str(pdf_path))
             pdf_bytes = pdf_path.read_bytes()
