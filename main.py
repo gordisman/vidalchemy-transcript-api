@@ -1,12 +1,3 @@
-# Transcript API (FastAPI) — Railway Starter Kit
-
-Here are your three files in clean copy‑blocks. Copy each one separately when creating files in GitHub.
-
----
-
-## `main.py`
-
-```python
 import os, re, json, base64, tempfile, subprocess
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -14,7 +5,13 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Creator Transcript Fetcher", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
 
 class Req(BaseModel):
     url_or_id: str
@@ -43,9 +40,13 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     blocks = re.split(r"\n\s*\n", raw.strip())
     lines = []
     for blk in blocks:
-        blk = re.sub(r"^\s*\d+\s*\n", "", blk)
+        blk = re.sub(r"^\s*\d+\s*\n", "", blk)  # remove index
         m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
-        text = re.sub(r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$", "", blk)
+        text = re.sub(
+            r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
+            "",
+            blk,
+        )
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
@@ -58,12 +59,13 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
 
-def as_data_url(mime: str, content: bytes, b64: bool = False) -> str:
+def as_data_url(mime: str, content: bytes | None, b64: bool = False) -> str:
+    if content is None:
+        return ""
     if b64:
         return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
-    else:
-        from urllib.parse import quote
-        return f"data:{mime},{quote(content.decode('utf-8'))}"
+    from urllib.parse import quote
+    return f"data:{mime},{quote(content.decode('utf-8'))}"
 
 @app.post("/transcript")
 def transcript(req: Req):
@@ -72,6 +74,8 @@ def transcript(req: Req):
 
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
+
+        # 1) metadata
         meta = get_meta(url)
         title = meta.get("title", "")
         channel = meta.get("channel") or meta.get("uploader", "")
@@ -80,8 +84,10 @@ def transcript(req: Req):
             published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
         duration_s = int(meta.get("duration") or 0)
 
+        # 2) download subtitles (manual then auto)
         base = [
-            "yt-dlp", "--skip-download",
+            "yt-dlp",
+            "--skip-download",
             "--sub-langs", req.langs,
             "--convert-subs", "srt",
             "--force-overwrites",
@@ -99,6 +105,7 @@ def transcript(req: Req):
         if not ok:
             raise HTTPException(status_code=404, detail="No captions available for this video.")
 
+        # 3) ensure .srt exists (convert from .vtt if needed)
         srt = next(iter(wd.glob(f"{vid}*.srt")), None)
         vtt = None if srt else next(iter(wd.glob(f"{vid}*.vtt")), None)
         if not srt and vtt:
@@ -107,10 +114,12 @@ def transcript(req: Req):
         if not srt or not srt.exists():
             raise HTTPException(status_code=404, detail="Failed to obtain subtitles.")
 
+        # 4) clean to text
         txt = clean_srt_to_text(srt, keep_ts=req.keep_timestamps)
         txt_bytes = txt.encode("utf-8")
         srt_bytes = srt.read_bytes()
 
+        # 5) optional PDF
         pdf_bytes = None
         try:
             from fpdf import FPDF
@@ -119,17 +128,18 @@ def transcript(req: Req):
             pdf.add_page()
             pdf.set_font("Arial", size=12)
             header = f"{title} — {channel}\n{url}\n\n"
-            for chunk in (header + txt).split("\n"):
-                pdf.multi_cell(0, 6, chunk)
+            for line in (header + txt).split("\n"):
+                pdf.multi_cell(0, 6, line)
             pdf_path = wd / f"transcript_{vid}.pdf"
             pdf.output(str(pdf_path))
             pdf_bytes = pdf_path.read_bytes()
         except Exception:
             pdf_bytes = None
 
+        # 6) build data URLs
         txt_url = as_data_url("text/plain;charset=utf-8", txt_bytes)
         srt_url = as_data_url("text/plain;charset=utf-8", srt_bytes)
-        pdf_url = as_data_url("application/pdf", pdf_bytes, b64=True) if pdf_bytes else ""
+        pdf_url = as_data_url("application/pdf", pdf_bytes, b64=True)
 
         preview = txt[:2500]
         return {
@@ -144,4 +154,3 @@ def transcript(req: Req):
             "srt_url": srt_url,
             "pdf_url": pdf_url,
         }
-```
