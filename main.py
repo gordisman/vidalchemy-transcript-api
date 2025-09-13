@@ -43,7 +43,7 @@ def _cleanup_tokens() -> None:
 # =========================
 # App
 # =========================
-app = FastAPI(title="Creator Transcript Fetcher", version="1.0.1")
+app = FastAPI(title="Creator Transcript Fetcher", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,11 +64,17 @@ def run(cmd):
     return p.stdout
 
 def video_id(u: str) -> str:
-    # Accept watch, youtu.be, shorts (and plain ID)
+    """
+    Extract the 11-char YouTube Video ID from watch, youtu.be, or shorts URLs.
+    If it already looks like an ID, return it unchanged.
+    """
     m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", u)
     return m.group(1) if m else u.strip()
 
 def get_meta(url: str) -> dict:
+    """
+    Fetch video metadata with yt-dlp -J. If it's a playlist entry, grab the first.
+    """
     out = run(["yt-dlp", "-J", "--skip-download", url])
     data = json.loads(out)
     if isinstance(data, dict) and data.get("entries"):
@@ -76,13 +82,23 @@ def get_meta(url: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
+    """
+    Convert SRT text into a clean paragraph (or timestamped lines if keep_ts).
+    """
     raw = srt_path.read_text(encoding="utf-8", errors="ignore")
     blocks = re.split(r"\n\s*\n", raw.strip())
     lines = []
     for blk in blocks:
+        # Remove numeric index line
         blk = re.sub(r"^\s*\d+\s*\n", "", blk)
+        # Extract a timestamp if present (for keep_ts)
         m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
-        text = re.sub(r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$", "", blk)
+        # Remove the timecode line from the text
+        text = re.sub(
+            r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
+            "",
+            blk,
+        )
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
@@ -91,7 +107,8 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
         else:
             lines.append(text)
     out = "\n".join(lines) if keep_ts else " ".join(lines)
-    out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)  # de-dup repeated words
+    # De-duplicate repeated words and tidy punctuation spacing
+    out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
 
@@ -110,12 +127,18 @@ def _external_base_url(request: Request) -> str:
     proto = request.headers.get("x-forwarded-proto") or "https"
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if not host:
-        # very defensive fallback
+        # Very defensive fallback (adjust to your Railway URL if needed)
         return "https://vidalchemy-transcript-api-production.up.railway.app"
+    # Force https if proto is missing or http
+    if proto != "https":
+        proto = "https"
     return f"{proto}://{host}"
 
 @app.get("/file/{token}")
 def file_download(token: str):
+    """
+    Serve a time-limited file by token with correct Content-Disposition.
+    """
     _cleanup_tokens()
     item = TOKENS.get(token)
     if not item or item.get("exp", 0) < _now():
@@ -129,6 +152,7 @@ def file_download(token: str):
 def transcript(req: Req, request: Request):
     _cleanup_tokens()
 
+    # Normalize URL / ID
     url = req.url_or_id if req.url_or_id.startswith("http") else f"https://www.youtube.com/watch?v={req.url_or_id}"
     vid = video_id(url)
 
@@ -144,27 +168,46 @@ def transcript(req: Req, request: Request):
             published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
         duration_s = int(meta.get("duration") or 0)
 
-        # -------- captions via yt-dlp
-        base_cmd = [
-            "yt-dlp",
-            "--skip-download",
-            "--sub-langs", req.langs,
-            "--convert-subs", "srt",
-            "--force-overwrites",
-            "-o", "%(id)s.%(ext)s",
-            url,
+        # -------- captions via yt-dlp (robust attempts)
+        # Strategies:
+        # 1) Manual subs for requested languages
+        # 2) Auto subs for requested languages
+        # 3) Auto subs for any English variant (en.*)
+        # 4) Auto subs for ANY language (all)
+        attempts = [
+            ("--write-sub",       req.langs),
+            ("--write-auto-sub",  req.langs),
+            ("--write-auto-sub",  "en.*"),
+            ("--write-auto-sub",  "all"),
         ]
+
         success = False
-        for mode in ("--write-sub", "--write-auto-sub"):
+        last_error = None
+
+        for mode, sublangs in attempts:
             try:
-                run(base_cmd[:1] + [mode] + base_cmd[1:])
+                cmd = [
+                    "yt-dlp",
+                    "--skip-download",
+                    "--sub-langs", sublangs,
+                    "--convert-subs", "srt",
+                    "--force-overwrites",
+                    "-o", "%(id)s.%(ext)s",
+                    mode,
+                    url,
+                ]
+                print(f"[yt-dlp] Trying {mode} with sub-langs='{sublangs}'")
+                run(cmd)
                 success = True
                 break
-            except Exception:
-                continue
+            except Exception as e:
+                last_error = str(e)
+                print(f"[yt-dlp] Attempt failed: {mode} / '{sublangs}' -> {last_error}")
+
         if not success:
             raise HTTPException(status_code=404, detail="No captions available for this video.")
 
+        # Find generated captions
         srt = next(iter(wd.glob(f"{vid}*.srt")), None)
         vtt = None if srt else next(iter(wd.glob(f"{vid}*.vtt")), None)
         if not srt and vtt:
@@ -208,7 +251,7 @@ def transcript(req: Req, request: Request):
             pdf_token = _add_token(pdf_bytes, "application/pdf", f"transcript_{vid}.pdf")
             pdf_http_url = f"{base}/file/{pdf_token}"
 
-        # also return data URLs as fallbacks (not for primary UI)
+        # Also return data URLs as fallbacks (not for primary UI)
         txt_url = as_data_url("text/plain;charset=utf-8", txt_bytes)
         srt_url = as_data_url("text/plain;charset=utf-8", srt_bytes)
         pdf_url = as_data_url("application/pdf", pdf_bytes, b64=True) if pdf_bytes else ""
