@@ -113,38 +113,89 @@ def make_pdf_bytes(title: str, channel: str, url: str, txt: str) -> bytes | None
 def try_fetch_srt(url: str, vid: str, langs: str, wd: Path) -> tuple[Path, str]:
     """
     Fetch subtitles for a single video id.
-    Strategy:
-      1) Try exactly the langs provided
-      2) Try any language + provided (e.g. "*,en")
-      3) Try "*"
-      4) Try "all"
-    Returns (srt_path, langs_used)
+
+    Improvements:
+      - Inspect available tracks first and report them when failing (manual + auto).
+      - Try a widened sequence of language patterns.
+      - Accept .vtt fallback and convert to .srt if yt-dlp didn't convert.
+    Returns (srt_path, langs_used) on success, raises 404 with details otherwise.
     """
+    # 1) Inspect what yt-dlp sees so we can report it if we fail
+    info_raw = run(["yt-dlp", "-J", "--skip-download", url])
+    info = json.loads(info_raw) or {}
+    if isinstance(info, dict) and info.get("entries"):
+        info = info["entries"][0]
+
+    subs = info.get("subtitles") or {}              # manual captions
+    autos = info.get("automatic_captions") or {}    # auto captions
+    manual_langs = sorted(list(subs.keys()))
+    auto_langs   = sorted(list(autos.keys()))
+    available_msg = f"manual={manual_langs or []}, auto={auto_langs or []}"
+
+    # 2) Build a base yt-dlp command; ask it to convert to srt
     base = [
         "yt-dlp", "--skip-download",
-        "--extractor-args", "youtube:player_client=android",  # stable client
+        "--extractor-args", "youtube:player_client=android",
         "--convert-subs", "srt",
         "--force-overwrites",
         "-o", "%(id)s.%(ext)s",
         url,
     ]
+
+    # 3) Try multiple language patterns
     attempts = []
+    langs = (langs or "").strip()
     if langs:
-        attempts.append(langs)
-        attempts.append(f"*,{langs}")
-    attempts += ["*", "all"]
+        attempts.append(langs)              # exact
+        attempts.append(f"*,{langs}")       # anything plus requested
+    attempts += ["all,-live_chat", "*", "all"]
+
+    def _first_existing(*patterns: str) -> Path | None:
+        for pat in patterns:
+            m = sorted(wd.glob(pat))
+            if m:
+                return m[0]
+        return None
 
     for sub_langs in attempts:
         for flag in ("--write-sub", "--write-auto-sub"):
             try:
                 cmd = base[:1] + [flag] + ["--sub-langs", sub_langs] + base[1:]
                 run(cmd)
-                matches = sorted(wd.glob(f"{vid}*.srt"))  # this video id only
-                if matches:
-                    return matches[0], sub_langs
+
+                # Prefer SRT; if SRT didn't appear, accept VTT then convert to SRT
+                srt = _first_existing(f"{vid}*.srt")
+                if srt:
+                    return srt, sub_langs
+
+                vtt = _first_existing(f"{vid}*.vtt")
+                if vtt:
+                    # try local conversion to SRT as a fallback
+                    srt_path = vtt.with_suffix(".srt")
+                    try:
+                        run(["ffmpeg", "-y", "-i", str(vtt), str(srt_path)])
+                        if srt_path.exists():
+                            return srt_path, sub_langs
+                    except Exception:
+                        # If conversion fails, still allow VTT (caller can read/clean it)
+                        # We'll rename to .srt for a consistent downstream path.
+                        vtt.rename(srt_path)
+                        return srt_path, sub_langs
+
             except Exception:
+                # try next combo
                 continue
-    raise HTTPException(status_code=404, detail="No captions were found (manual+auto).")
+
+    # 4) Nothing worked – return a detailed 404 with what yt-dlp reported
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "No captions were found (manual+auto). "
+            f"yt-dlp reported available tracks: {available_msg}. "
+            "Try passing langs='all' or the specific language code(s) you see listed."
+        ),
+    )
+
 
 # -------------
 # Models
