@@ -1,10 +1,8 @@
 import os
 import re
-import io
 import json
 import time
 import base64
-import shutil
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -15,10 +13,10 @@ from pydantic import BaseModel
 from yt_dlp import YoutubeDL
 
 # -----------------------------
-# Config (via env or sane defaults)
+# Config
 # -----------------------------
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-EXPIRES_IN_SECONDS = int(os.getenv("FILE_EXPIRES_SECONDS", "86400"))  # 24h default
+EXPIRES_IN_SECONDS = int(os.getenv("FILE_EXPIRES_SECONDS", "86400"))  # 24h
 PORT = int(os.getenv("PORT", "8000"))
 
 # -----------------------------
@@ -37,11 +35,14 @@ app.add_middleware(
 # -----------------------------
 FILES: Dict[str, Dict] = {}  # token -> {path, mime, filename, expires_at}
 
+
 def _tok() -> str:
     return base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
 
+
 def _now() -> int:
     return int(time.time())
+
 
 def _purge_expired() -> None:
     dead = []
@@ -55,6 +56,7 @@ def _purge_expired() -> None:
             pass
         FILES.pop(t, None)
 
+
 def _store_file(path: Path, mime: str, filename: str) -> str:
     _purge_expired()
     token = _tok()
@@ -66,10 +68,10 @@ def _store_file(path: Path, mime: str, filename: str) -> str:
     }
     return token
 
+
 def _file_url(token: str) -> str:
-    if not PUBLIC_BASE_URL:
-        return ""
-    return f"{PUBLIC_BASE_URL}/file/{token}"
+    base = PUBLIC_BASE_URL or "https://vidalchemy-transcript-api-production.up.railway.app"
+    return f"{base}/file/{token}"
 
 # -----------------------------
 # Utility
@@ -85,8 +87,10 @@ def pretty_duration(seconds: int) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
+
 def normalize_lang(code: str) -> str:
     return code.strip().lower()
+
 
 def ordered_langs(user_langs: str) -> List[str]:
     pref = ["en", "en-us", "en-gb"]
@@ -104,6 +108,7 @@ def ordered_langs(user_langs: str) -> List[str]:
         out.append("all")
     return out
 
+
 def extract_video_id(url_or_id: str) -> str:
     u = url_or_id.strip()
     m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", u)
@@ -112,6 +117,7 @@ def extract_video_id(url_or_id: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", u):
         return u
     return u
+
 
 def yt_info(url: str) -> dict:
     ydl_opts = {
@@ -133,23 +139,22 @@ def yt_info(url: str) -> dict:
         raise Exception("Failed to fetch video metadata.")
     return info
 
+
 def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str]:
     subs = info.get("subtitles") or {}
     autos = info.get("automatic_captions") or {}
 
     manual_langs = {normalize_lang(k): k for k in subs.keys()}
-    auto_langs   = {normalize_lang(k): k for k in autos.keys()}
+    auto_langs = {normalize_lang(k): k for k in autos.keys()}
 
     for want in pref_langs:
         if want == "all":
-            for norm, raw in manual_langs.items():
-                cand = subs.get(raw) or []
-                url = best_caption_url(cand)
+            for raw in manual_langs.values():
+                url = best_caption_url(subs.get(raw) or [])
                 if url:
                     return ("manual", raw, url)
-            for norm, raw in auto_langs.items():
-                cand = autos.get(raw) or []
-                url = best_caption_url(cand)
+            for raw in auto_langs.values():
+                url = best_caption_url(autos.get(raw) or [])
                 if url:
                     return ("auto", raw, url)
         else:
@@ -164,12 +169,13 @@ def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str
                 if url:
                     return ("auto", raw, url)
 
-    for norm, raw in auto_langs.items():
+    for raw in auto_langs.values():
         url = best_caption_url(autos.get(raw) or [])
         if url:
             return ("auto", raw, url)
 
     raise Exception("No captions were found in requested/available languages.")
+
 
 def best_caption_url(tracks: List[dict]) -> Optional[str]:
     if not tracks:
@@ -181,6 +187,7 @@ def best_caption_url(tracks: List[dict]) -> Optional[str]:
         if t.get("url"):
             return t["url"]
     return None
+
 
 def http_fetch(url: str) -> bytes:
     req = urllib.request.Request(
@@ -195,6 +202,7 @@ def http_fetch(url: str) -> bytes:
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
+
 
 def vtt_to_srt_bytes(vtt: bytes) -> bytes:
     text = vtt.decode("utf-8", errors="ignore")
@@ -230,6 +238,7 @@ def vtt_to_srt_bytes(vtt: bytes) -> bytes:
                 buf.append(ln)
     flush()
     return ("\n".join(out_lines)).encode("utf-8")
+
 
 def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
     raw = srt_bytes.decode("utf-8", errors="ignore")
@@ -275,6 +284,7 @@ def health():
         "expires_in_seconds_default": EXPIRES_IN_SECONDS,
     }
 
+
 @app.get("/probe")
 def probe(url: str):
     vid = extract_video_id(url)
@@ -300,6 +310,7 @@ def probe(url: str):
         "timedtext_samples": samples,
     }
 
+
 @app.get("/file/{token}")
 def get_file(token: str):
     meta = FILES.get(token)
@@ -312,9 +323,24 @@ def get_file(token: str):
     if not p.exists():
         _purge_expired()
         raise HTTPException(404, "File not found.")
-    headers = {"Content-Disposition": f"attachment; filename={json.dumps(meta['filename'])}"}
-    return Response(p.read_bytes(), headers=headers, media_type=meta["mime"])
 
+    # Force download with correct filename and MIME type
+    headers = {"Content-Disposition": f'attachment; filename="{meta["filename"]}"'}
+
+    # Ensure correct MIME types
+    mime = meta["mime"]
+    if meta["filename"].endswith(".srt"):
+        mime = "application/x-subrip"
+    elif meta["filename"].endswith(".pdf"):
+        mime = "application/pdf"
+    elif meta["filename"].endswith(".txt"):
+        mime = "text/plain"
+
+    return Response(p.read_bytes(), headers=headers, media_type=mime)
+
+# -----------------------------
+# Transcript endpoint
+# -----------------------------
 @app.post("/transcript")
 def transcript(req: Req):
     vid = extract_video_id(req.url_or_id)
@@ -383,7 +409,7 @@ def transcript(req: Req):
         except Exception:
             pdf_bytes = None
 
-        srt_tok = _store_file(srt_path, "text/plain", srt_path.name)
+        srt_tok = _store_file(srt_path, "application/x-subrip", srt_path.name)
         txt_tok = _store_file(txt_path, "text/plain", txt_path.name)
         pdf_tok = _store_file(pdf_path, "application/pdf", pdf_path.name) if pdf_bytes else None
 
