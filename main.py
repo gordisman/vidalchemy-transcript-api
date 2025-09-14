@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.2.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -89,7 +89,18 @@ def pretty_duration(seconds: int) -> str:
 
 
 def normalize_lang(code: str) -> str:
-    return code.strip().lower()
+    """
+    Normalize YouTube caption codes:
+    - Lowercase
+    - Strip region suffixes (nl-NL -> nl, es-419 -> es)
+    - Remove "-orig"
+    """
+    code = code.strip().lower()
+    if "-" in code:
+        code = code.split("-")[0]
+    if code.endswith("orig"):
+        code = code.replace("orig", "")
+    return code.strip()
 
 
 def ordered_langs(user_langs: str) -> List[str]:
@@ -292,14 +303,6 @@ def probe(url: str):
     info = yt_info(full)
     manual = sorted((info.get("subtitles") or {}).keys())
     auto = sorted((info.get("automatic_captions") or {}).keys())
-    samples = []
-    for test in ["en", "en-US", "nl"]:
-        if test in (info.get("subtitles") or {}):
-            samples.append({"lang": test, "status": 200})
-        elif test in (info.get("automatic_captions") or {}):
-            samples.append({"lang": test, "status": 200})
-        else:
-            samples.append({"lang": test, "status": 404})
     return {
         "info": {
             "title": info.get("title"),
@@ -307,7 +310,6 @@ def probe(url: str):
             "subtitles_keys": manual,
             "auto_captions_keys": auto,
         },
-        "timedtext_samples": samples,
     }
 
 
@@ -338,9 +340,7 @@ def get_file(token: str):
 
     return Response(p.read_bytes(), headers=headers, media_type=mime)
 
-# -----------------------------
-# Transcript endpoint
-# -----------------------------
+
 @app.post("/transcript")
 def transcript(req: Req):
     vid = extract_video_id(req.url_or_id)
