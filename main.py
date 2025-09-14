@@ -115,26 +115,37 @@ def try_fetch_srt(url: str, vid: str, langs: str, wd: Path) -> tuple[Path, str]:
     Fetch subtitles for a single video id.
 
     Improvements:
-      - Inspect available tracks first and report them when failing (manual + auto).
-      - Try a widened sequence of language patterns.
-      - Accept .vtt fallback and convert to .srt if yt-dlp didn't convert.
+      - Inspect actual tracks and filter out empty entries (manual+auto).
+      - Report only *real* available languages on failure.
+      - Try wider sub-lang patterns.
+      - Accept VTT fallback and convert to SRT as needed.
     Returns (srt_path, langs_used) on success, raises 404 with details otherwise.
     """
-    # 1) Inspect what yt-dlp sees so we can report it if we fail
+    # -- Step 1: Inspect info JSON
     info_raw = run(["yt-dlp", "-J", "--skip-download", url])
     info = json.loads(info_raw) or {}
     if isinstance(info, dict) and info.get("entries"):
         info = info["entries"][0]
 
-    subs = info.get("subtitles") or {}              # manual captions
-    autos = info.get("automatic_captions") or {}    # auto captions
-    manual_langs = sorted(list(subs.keys()))
-    auto_langs   = sorted(list(autos.keys()))
-    available_msg = f"manual={manual_langs or []}, auto={auto_langs or []}"
+    subs_all  = info.get("subtitles") or {}
+    autos_all = info.get("automatic_captions") or {}
 
-    # 2) Build a base yt-dlp command; ask it to convert to srt
+    # Keep only languages that have at least one entry with a URL
+    def real_langs(d: dict) -> list[str]:
+        real = []
+        for code, formats in (d or {}).items():
+            # formats is usually a list of dicts; keep only if there is a 'url'
+            if any(isinstance(f, dict) and f.get("url") for f in (formats or [])):
+                real.append(code)
+        return sorted(real)
+
+    manual_langs = real_langs(subs_all)
+    auto_langs   = real_langs(autos_all)
+
+    # -- Step 2: Prepare yt-dlp command
     base = [
         "yt-dlp", "--skip-download",
+        # helps with some newer player responses
         "--extractor-args", "youtube:player_client=android",
         "--convert-subs", "srt",
         "--force-overwrites",
@@ -142,19 +153,20 @@ def try_fetch_srt(url: str, vid: str, langs: str, wd: Path) -> tuple[Path, str]:
         url,
     ]
 
-    # 3) Try multiple language patterns
-    attempts = []
+    # -- Step 3: Try multiple language patterns
+    attempts: list[str] = []
     langs = (langs or "").strip()
     if langs:
-        attempts.append(langs)              # exact
-        attempts.append(f"*,{langs}")       # anything plus requested
+        attempts.append(langs)              # user’s explicit request
+        attempts.append(f"*,{langs}")       # anything + requested
+    # good broad fallbacks
     attempts += ["all,-live_chat", "*", "all"]
 
-    def _first_existing(*patterns: str) -> Path | None:
-        for pat in patterns:
-            m = sorted(wd.glob(pat))
-            if m:
-                return m[0]
+    def find_first(*globs: str) -> Path | None:
+        for g in globs:
+            found = sorted(wd.glob(g))
+            if found:
+                return found[0]
         return None
 
     for sub_langs in attempts:
@@ -163,36 +175,36 @@ def try_fetch_srt(url: str, vid: str, langs: str, wd: Path) -> tuple[Path, str]:
                 cmd = base[:1] + [flag] + ["--sub-langs", sub_langs] + base[1:]
                 run(cmd)
 
-                # Prefer SRT; if SRT didn't appear, accept VTT then convert to SRT
-                srt = _first_existing(f"{vid}*.srt")
+                # Prefer SRT
+                srt = find_first(f"{vid}*.srt")
                 if srt:
                     return srt, sub_langs
 
-                vtt = _first_existing(f"{vid}*.vtt")
+                # Fallback: VTT -> SRT
+                vtt = find_first(f"{vid}*.vtt")
                 if vtt:
-                    # try local conversion to SRT as a fallback
                     srt_path = vtt.with_suffix(".srt")
                     try:
                         run(["ffmpeg", "-y", "-i", str(vtt), str(srt_path)])
                         if srt_path.exists():
                             return srt_path, sub_langs
                     except Exception:
-                        # If conversion fails, still allow VTT (caller can read/clean it)
-                        # We'll rename to .srt for a consistent downstream path.
+                        # As a last resort, rename VTT to .srt so downstream stays consistent
                         vtt.rename(srt_path)
                         return srt_path, sub_langs
 
             except Exception:
-                # try next combo
+                # try next pattern
                 continue
 
-    # 4) Nothing worked – return a detailed 404 with what yt-dlp reported
+    # -- Step 4: Fail with *filtered* availability info so it’s trustworthy
+    avail_msg = f"manual={manual_langs or []}, auto={auto_langs or []}"
     raise HTTPException(
         status_code=404,
         detail=(
             "No captions were found (manual+auto). "
-            f"yt-dlp reported available tracks: {available_msg}. "
-            "Try passing langs='all' or the specific language code(s) you see listed."
+            f"Available tracks (non-empty): {avail_msg}. "
+            "Try passing langs='all' or a specific code you see listed (e.g., 'nl')."
         ),
     )
 
