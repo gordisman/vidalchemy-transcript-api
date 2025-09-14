@@ -1,27 +1,63 @@
-# main.py
-# Creator Transcript Fetcher — stable + TimedText fallback
 import os
 import re
 import json
-import base64
-import string
-import random
-import threading
 import time
+import base64
+import shutil
+import secrets
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List
+from typing import Optional, Tuple, List, Dict
 
-import requests
-from fastapi import FastAPI, HTTPException, Path as FPath, Request
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+from starlette.responses import FileResponse, PlainTextResponse
 
-# ---------------------------
-# App & CORS
-# ---------------------------
+# -----------------------------
+# Config & simple file registry
+# -----------------------------
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+FILE_TTL_SECONDS = int(os.environ.get("FILE_TTL_SECONDS", "86400"))  # 24h default
+FILES_DIR = Path("/tmp/vafiles")
+FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+# token -> {path: Path, mime: str, filename: str, expires_at: float}
+TOKENS: Dict[str, Dict] = {}
+
+def now() -> float:
+    return time.time()
+
+def purge_expired_tokens() -> None:
+    to_del = [t for t, meta in TOKENS.items() if meta["expires_at"] <= now()]
+    for t in to_del:
+        try:
+            p: Path = TOKENS[t]["path"]
+            if p.exists():
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+        TOKENS.pop(t, None)
+
+def register_file(path: Path, mime: str, filename: str) -> str:
+    purge_expired_tokens()
+    token = secrets.token_hex(16)
+    TOKENS[token] = {
+        "path": path,
+        "mime": mime,
+        "filename": filename,
+        "expires_at": now() + FILE_TTL_SECONDS,
+    }
+    if not PUBLIC_BASE_URL:
+        # Fallback: relative path (works in Swagger), but for GPT Action you should set PUBLIC_BASE_URL.
+        return f"/file/{token}"
+    return f"{PUBLIC_BASE_URL}/file/{token}"
+
+
+# -------------
+# FastAPI app
+# -------------
 app = FastAPI(title="Creator Transcript Fetcher", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
@@ -31,42 +67,29 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-# ---------------------------
-# Config (via env with sane defaults)
-# ---------------------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-LINKS_TTL_SECONDS = int(os.getenv("LINKS_TTL_SECONDS", "86400"))  # default 24h
-PREVIEW_CHARS = int(os.getenv("PREVIEW_CHARS", "2800"))
+# -------------
+# Models
+# -------------
+class Req(BaseModel):
+    url_or_id: str
+    langs: str = "en,en-US,en-GB"
+    keep_timestamps: bool = False
 
-# ---------------------------
-# Small utilities
-# ---------------------------
+
+# -------------
+# Helpers
+# -------------
 def run(cmd: List[str]) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        msg = (p.stderr or p.stdout or "").strip()
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{msg}")
+        raise RuntimeError(p.stderr or p.stdout)
     return p.stdout
-
-def pretty_duration(seconds: int) -> str:
-    try:
-        seconds = int(seconds)
-    except Exception:
-        return "0s"
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
 
 def video_id(u: str) -> str:
     m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", u)
     return m.group(1) if m else u.strip()
 
-def get_info(url: str) -> dict:
+def get_meta(url: str) -> dict:
     out = run(["yt-dlp", "-J", "--skip-download", url])
     data = json.loads(out)
     if isinstance(data, dict) and data.get("entries"):
@@ -75,14 +98,14 @@ def get_info(url: str) -> dict:
 
 def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     raw = srt_path.read_text(encoding="utf-8", errors="ignore")
+    # Split blocks on blank lines
     blocks = re.split(r"\n\s*\n", raw.strip())
     lines = []
     for blk in blocks:
-        # drop counter line
+        # Remove leading index number
         blk = re.sub(r"^\s*\d+\s*\n", "", blk)
-        # capture timestamp line
+        # Remove timing line
         m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
-        # remove timestamp line
         text = re.sub(r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$", "", blk)
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
@@ -92,54 +115,75 @@ def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
         else:
             lines.append(text)
     out = "\n".join(lines) if keep_ts else " ".join(lines)
-    # light de-dup and spacing cleanup
+    # De-dupe simple repeated words caused by subtitle overlap
     out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
 
-# ---------------------------
-# File token store (in-memory)
-# ---------------------------
-class FileItem(BaseModel):
-    path: str
-    mime: str
-    filename: str
-    expires_at: float
 
-_TOKEN_STORE: Dict[str, FileItem] = {}
-_TOKEN_LOCK = threading.Lock()
+# -----------------------------
+# TimedText XML → SRT converter
+# -----------------------------
+def xml_to_srt(xml_text: str, out_srt_path: Path) -> bool:
+    """
+    Convert YouTube TimedText XML/TTML (<transcript><text ...>) to SRT.
+    Returns True on success.
+    """
+    try:
+        import html
+        import xml.etree.ElementTree as ET
 
-def _new_token(n: int = 32) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.choice(alphabet) for _ in range(n))
+        root = ET.fromstring(xml_text)
+        entries = []
+        idx = 1
 
-def register_file(path: Path, mime: str, filename: str, ttl: int) -> str:
-    token = _new_token()
-    item = FileItem(path=str(path), mime=mime, filename=filename, expires_at=time.time() + ttl)
-    with _TOKEN_LOCK:
-        _TOKEN_STORE[token] = item
-        # opportunistic cleanup
-        now = time.time()
-        for t, it in list(_TOKEN_STORE.items()):
-            if it.expires_at < now:
-                _TOKEN_STORE.pop(t, None)
-    return token
+        for node in root.iter("text"):
+            start = float(node.attrib.get("start", "0"))
+            dur = float(node.attrib.get("dur", "0"))
+            end = start + dur
 
-def token_url(request: Request, token: str) -> str:
-    if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}/file/{token}"
-    # fallback to request base (useful in /docs)
-    base = str(request.base_url).rstrip("/")
-    return f"{base}/file/{token}"
+            def fmt(t):
+                h = int(t // 3600)
+                m = int((t % 3600) // 60)
+                s = int(t % 60)
+                ms = int(round((t - int(t)) * 1000))
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-# ---------------------------
-# YouTube TimedText fallback
-# ---------------------------
+            text = "".join(node.itertext())
+            text = html.unescape(text).replace("\n", " ").strip()
+            if not text:
+                continue
+
+            entries.append(f"{idx}\n{fmt(start)} --> {fmt(end)}\n{text}\n")
+            idx += 1
+
+        if not entries:
+            return False
+
+        out_srt_path.write_text("\n".join(entries), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+# -----------------------------
+# TimedText fallback (VTT + XML)
+# -----------------------------
 def timedtext_fallback(vid: str, wd: Path, langs_to_try: List[str]) -> Optional[Tuple[Path, str]]:
     """
-    Try fetching captions directly from the YouTube TimedText endpoint.
-    Returns (srt_path, lang_used) on success, else None.
+    Fetch captions directly from the YouTube TimedText endpoint.
+    Supports BOTH VTT and XML/TTML. Returns (srt_path, lang_used) on success, else None.
     """
+    import requests
+
+    def tt_url(lang: str, asr: bool, fmt: Optional[str]) -> str:
+        base = f"https://www.youtube.com/api/timedtext?v={vid}&lang={lang}"
+        if asr:
+            base += "&kind=asr"
+        if fmt:
+            base += f"&fmt={fmt}"
+        return base
+
     def save_convert_vtt(vtt_text: str, lang: str) -> Optional[Path]:
         vtt_path = wd / f"{vid}.{lang}.vtt"
         vtt_path.write_text(vtt_text, encoding="utf-8")
@@ -149,7 +193,7 @@ def timedtext_fallback(vid: str, wd: Path, langs_to_try: List[str]) -> Optional[
             if srt_path.exists():
                 return srt_path
         except Exception:
-            # last resort: rename VTT to SRT
+            # Worst case, rename (not perfect, but gives user something)
             try:
                 vtt_path.rename(srt_path)
                 return srt_path
@@ -157,190 +201,125 @@ def timedtext_fallback(vid: str, wd: Path, langs_to_try: List[str]) -> Optional[
                 return None
         return None
 
-    def tt_url(lang: str, asr: bool) -> str:
-        base = f"https://www.youtube.com/api/timedtext?v={vid}&lang={lang}&fmt=vtt"
-        return base + ("&kind=asr" if asr else "")
-
     for lang in langs_to_try:
         for asr in (False, True):
+            # Try VTT
             try:
-                r = requests.get(tt_url(lang, asr), timeout=12)
+                r = requests.get(tt_url(lang, asr, "vtt"), timeout=12)
                 if r.status_code == 200 and r.text and "WEBVTT" in r.text[:1000]:
                     srt_path = save_convert_vtt(r.text, lang)
                     if srt_path:
                         return srt_path, lang
             except Exception:
-                continue
+                pass
+
+            # Try XML/TTML -> SRT
+            try:
+                r = requests.get(tt_url(lang, asr, None), timeout=12)
+                if r.status_code == 200 and r.text and "<transcript" in r.text[:1000]:
+                    srt_path = wd / f"{vid}.{lang}.srt"
+                    if xml_to_srt(r.text, srt_path):
+                        return srt_path, lang
+            except Exception:
+                pass
+
     return None
 
-# ---------------------------
-# Core subtitle fetch
-# ---------------------------
-def try_fetch_srt(url: str, vid: str, langs: str, wd: Path) -> Tuple[Path, str, str]:
+
+# -----------------------------
+# yt-dlp caption fetch
+# -----------------------------
+def fetch_with_ytdlp(url: str, langs: str, wd: Path) -> Tuple[Optional[Path], str, str]:
     """
-    Fetch subtitles for a single video id.
-
-    Returns (srt_path, lang_used, source_kind)
-    source_kind is one of: "manual", "auto", "timedtext"
+    Attempt to fetch captions with yt-dlp.
+    Returns (srt_path, lang_used, kind) where kind in {"manual","auto"}; or (None,"","") on failure.
     """
-    # 1) Probe info and filter out empty tracks
-    info = get_info(url)
-    subs_all  = info.get("subtitles") or {}
-    autos_all = info.get("automatic_captions") or {}
+    # Normalize special cases
+    langs = (langs or "").strip()
+    if langs.lower() in ("", "all"):
+        sub_langs = "all"
+    else:
+        sub_langs = langs
 
-    def real_langs(d: dict) -> List[str]:
-        real = []
-        for code, formats in (d or {}).items():
-            if any(isinstance(f, dict) and f.get("url") for f in (formats or [])):
-                real.append(code)
-        return sorted(set(real))
-
-    manual_langs = real_langs(subs_all)
-    auto_langs   = real_langs(autos_all)
-
-    # 2) Try yt-dlp
     base = [
-        "yt-dlp", "--skip-download",
-        "--extractor-args", "youtube:player_client=android",
+        "yt-dlp",
+        "--skip-download",
         "--convert-subs", "srt",
         "--force-overwrites",
         "-o", "%(id)s.%(ext)s",
         url,
     ]
 
-    attempts: List[str] = []
-    langs = (langs or "").strip()
-    if langs:
-        attempts.append(langs)            # exact user req
-        attempts.append(f"*,{langs}")     # anything + user req
-    attempts += ["all,-live_chat", "*", "all"]
-
-    def find_first(*globs: str) -> Optional[Path]:
-        for g in globs:
-            found = sorted(wd.glob(g))
-            if found:
-                return found[0]
-        return None
-
-    for sub_langs in attempts:
-        for flag in ("--write-sub", "--write-auto-sub"):
-            try:
-                cmd = base[:1] + [flag] + ["--sub-langs", sub_langs] + base[1:]
-                run(cmd)
-                srt = find_first(f"{vid}*.srt")
-                if srt:
-                    kind = "manual" if flag == "--write-sub" else "auto"
-                    return srt, sub_langs, kind
-                vtt = find_first(f"{vid}*.vtt")
-                if vtt:
-                    srt_path = vtt.with_suffix(".srt")
-                    try:
-                        run(["ffmpeg", "-y", "-i", str(vtt), str(srt_path)])
-                        if srt_path.exists():
-                            kind = "manual" if flag == "--write-sub" else "auto"
-                            return srt_path, sub_langs, kind
-                    except Exception:
-                        vtt.rename(srt_path)
-                        kind = "manual" if flag == "--write-sub" else "auto"
-                        return srt_path, sub_langs, kind
-            except Exception:
-                continue
-
-    # 3) TimedText fallback
-    requested_langs = []
-    if langs:
-        for part in re.split(r"[,\s]+", langs):
-            part = part.strip()
-            if part and part not in ("*", "all"):
-                requested_langs.append(part)
-
-    candidates = list(dict.fromkeys(
-        requested_langs +
-        manual_langs +
-        auto_langs +
-        ["en-US", "en-GB", "en", "nl", "de", "fr", "es"]
-    ))
-
-    tt = timedtext_fallback(vid, wd, candidates)
-    if tt:
-        srt_path, used_lang = tt
-        return srt_path, used_lang, "timedtext"
-
-    # 4) Fail with filtered availability
-    avail_msg = f"manual={manual_langs or []}, auto={auto_langs or []}"
-    raise HTTPException(
-        status_code=404,
-        detail=(
-            "No captions were found (manual+auto). "
-            f"Available tracks (non-empty): {avail_msg}. "
-            "Try passing langs='all' or a specific code you see listed."
-        ),
-    )
-
-# ---------------------------
-# PDF helper (best-effort)
-# ---------------------------
-def make_pdf_from_text(header: str, body: str, out_path: Path) -> bool:
+    # Try MANUAL first
     try:
-        from fpdf import FPDF
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=12)
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        for line in (header + body).split("\n"):
-            pdf.multi_cell(0, 6, line)
-        pdf.output(str(out_path))
-        return out_path.exists()
+        run(["yt-dlp", "--sub-langs", sub_langs, "--write-sub"] + base[2:])
+        # pick first .srt in wd
+        srt = next(iter(wd.glob("*.srt")), None)
+        if srt:
+            # Try to infer language from filename: <videoid>.<lang>.srt or <lang>.srt
+            m = re.search(r"\.([a-zA-Z0-9-]{1,10})\.srt$", srt.name)
+            lang_used = m.group(1) if m else ""
+            return srt, (lang_used or ""), "manual"
     except Exception:
-        return False
+        pass
 
-# ---------------------------
-# API models
-# ---------------------------
-class Req(BaseModel):
-    url_or_id: str
-    langs: str = "en,en-US,en-GB,all"
-    keep_timestamps: bool = False
+    # Try AUTO
+    try:
+        run(["yt-dlp", "--sub-langs", sub_langs, "--write-auto-sub"] + base[2:])
+        srt = next(iter(wd.glob("*.srt")), None)
+        if srt:
+            m = re.search(r"\.([a-zA-Z0-9-]{1,10})\.srt$", srt.name)
+            lang_used = m.group(1) if m else ""
+            return srt, (lang_used or ""), "auto"
+    except Exception:
+        pass
 
-# ---------------------------
-# Routes
-# ---------------------------
+    return None, "", ""
+
+
+def pretty_seconds(total: int) -> str:
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+# -------------
+# Endpoints
+# -------------
 @app.get("/health")
 def health():
-    return {"ok": True, "version": app.version}
+    purge_expired_tokens()
+    return {"ok": True, "expires_in_seconds_default": FILE_TTL_SECONDS}
 
 @app.get("/file/{token}")
-def get_file(token: str = FPath(...)):
-    with _TOKEN_LOCK:
-        item = _TOKEN_STORE.get(token)
-        if not item:
-            raise HTTPException(status_code=404, detail="Invalid or expired token.")
-        if item.expires_at < time.time():
-            _TOKEN_STORE.pop(token, None)
-            raise HTTPException(status_code=404, detail="Link expired.")
-        path = Path(item.path)
-        if not path.exists():
-            _TOKEN_STORE.pop(token, None)
-            raise HTTPException(status_code=404, detail="File not found (expired).")
+def get_file(token: str):
+    purge_expired_tokens()
+    meta = TOKENS.get(token)
+    if not meta:
+        raise HTTPException(404, "Link expired or invalid.")
+    path: Path = meta["path"]
+    if not path.exists():
+        raise HTTPException(404, "File no longer exists.")
+    # Content-Disposition: attachment; filename="..."
+    headers = {"Content-Disposition": f'attachment; filename="{meta["filename"]}"'}
+    return FileResponse(path, media_type=meta["mime"], headers=headers)
 
-    def iterfile():
-        with open(path, "rb") as f:
-            yield from f
-
-    headers = {
-        "Content-Disposition": f"attachment; filename=\"{item.filename}\""
-    }
-    return StreamingResponse(iterfile(), media_type=item.mime, headers=headers)
 
 @app.post("/transcript")
-def transcript(req: Req, request: Request):
+def transcript(req: Req):
     url = req.url_or_id if req.url_or_id.startswith("http") else f"https://www.youtube.com/watch?v={req.url_or_id}"
     vid = video_id(url)
 
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
 
-        meta = get_info(url)
+        # Metadata
+        meta = get_meta(url)
         title = meta.get("title", "")
         channel = meta.get("channel") or meta.get("uploader", "")
         published_at = meta.get("upload_date", "")
@@ -348,45 +327,86 @@ def transcript(req: Req, request: Request):
             published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
         duration_s = int(meta.get("duration") or 0)
 
-        # Fetch SRT (yt-dlp first, then TimedText)
-        srt_path, lang_used, source_kind = try_fetch_srt(url, vid, req.langs, wd)
+        # Try yt-dlp (manual → auto)
+        srt_path, lang_used, kind = fetch_with_ytdlp(url, req.langs, wd)
 
-        # TXT (cleaned)
-        txt_text = clean_srt_to_text(srt_path, keep_ts=req.keep_timestamps)
-        txt_path = wd / f"{vid}_{lang_used}.txt"
-        txt_path.write_text(txt_text, encoding="utf-8")
+        # If yt-dlp failed, try TimedText fallback
+        if not srt_path:
+            # Build lang list to try
+            langs_field = (req.langs or "").strip().lower()
+            if langs_field in ("", "all"):
+                langs_to_try = ["en", "en-US", "en-GB", "nl", "fr", "de", "es", "pt", "it", "ja", "ko", "zh", "zh-TW", "hi", "ar", "ru"]
+            else:
+                # expand wildcards like "en,*"
+                parts = [p.strip() for p in langs_field.split(",") if p.strip()]
+                langs_to_try = []
+                for p in parts:
+                    if p == "*":
+                        # add a broad set
+                        langs_to_try += ["en", "en-US", "en-GB", "nl", "fr", "de", "es", "pt", "it", "ja", "ko", "zh", "zh-TW", "hi", "ar", "ru"]
+                    else:
+                        langs_to_try.append(p)
+            tt = timedtext_fallback(vid, wd, langs_to_try)
+            if tt:
+                srt_path, lang_used = tt
+                kind = "timedtext"
+
+        if not srt_path or not srt_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="No captions were found (manual/auto/TimedText). Try a different video or pass a specific language (e.g., 'nl')."
+            )
+
+        # Generate .txt from srt
+        txt = clean_srt_to_text(srt_path, keep_ts=req.keep_timestamps)
+        txt_path = wd / f"{vid}.txt"
+        txt_path.write_text(txt, encoding="utf-8")
 
         # PDF (best effort)
-        pdf_path = wd / f"{vid}_{lang_used}.pdf"
-        header = f"{title} — {channel}\nhttps://www.youtube.com/watch?v={vid}\n\n"
-        made_pdf = make_pdf_from_text(header, txt_text, pdf_path)
+        pdf_path = None
+        try:
+            from fpdf import FPDF
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=12)
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+            header = f"{title} — {channel}\nhttps://www.youtube.com/watch?v={vid}\n\n"
+            for line in (header + txt).split("\n"):
+                pdf.multi_cell(0, 6, line)
+            pdf_path = wd / f"{vid}.pdf"
+            pdf.output(str(pdf_path))
+        except Exception:
+            pdf_path = None  # ignore PDF failure
 
-        # Register HTTP links
-        txt_token = register_file(txt_path, "text/plain; charset=utf-8", txt_path.name, LINKS_TTL_SECONDS)
-        srt_token = register_file(srt_path, "text/plain; charset=utf-8", srt_path.name, LINKS_TTL_SECONDS)
-        pdf_token = register_file(pdf_path, "application/pdf", pdf_path.name, LINKS_TTL_SECONDS) if made_pdf else None
+        # Move files to persisted dir and register tokens
+        persisted_txt = FILES_DIR / f"{vid}.txt"
+        persisted_srt = FILES_DIR / f"{vid}.srt"
+        shutil.copyfile(txt_path, persisted_txt)
+        shutil.copyfile(srt_path, persisted_srt)
 
-        txt_http_url = token_url(request, txt_token)
-        srt_http_url = token_url(request, srt_token)
-        pdf_http_url = token_url(request, pdf_token) if pdf_token else ""
+        txt_url = register_file(persisted_txt, "text/plain", f"{vid}.txt")
+        srt_url = register_file(persisted_srt, "text/plain", f"{vid}.srt")
 
-        # Preview
-        preview = txt_text[:PREVIEW_CHARS]
-        truncated = len(txt_text) > len(preview)
+        pdf_url = ""
+        if pdf_path and pdf_path.exists():
+            persisted_pdf = FILES_DIR / f"{vid}.pdf"
+            shutil.copyfile(pdf_path, persisted_pdf)
+            pdf_url = register_file(persisted_pdf, "application/pdf", f"{vid}.pdf")
 
+        preview = txt[:2500]
         return {
             "title": title,
             "channel": channel,
             "published_at": published_at,
             "duration_s": duration_s,
-            "duration_pretty": pretty_duration(duration_s),
+            "duration_pretty": pretty_seconds(duration_s),
             "video_id": vid,
-            "captions_lang": lang_used,
-            "captions_kind": source_kind,  # "manual" | "auto" | "timedtext"
+            "captions_lang": lang_used or "",
+            "captions_kind": kind or "",
             "preview_text": preview,
-            "truncated": truncated,
-            "txt_http_url": txt_http_url,
-            "srt_http_url": srt_http_url,
-            "pdf_http_url": pdf_http_url,
-            "links_expire_in_seconds": LINKS_TTL_SECONDS,
+            "truncated": len(txt) > len(preview),
+            "txt_http_url": txt_url,
+            "srt_http_url": srt_url,
+            "pdf_http_url": pdf_url,
+            "links_expire_in_seconds": FILE_TTL_SECONDS,
         }
