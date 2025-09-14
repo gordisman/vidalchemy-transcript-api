@@ -1,338 +1,457 @@
-# main.py  —  stable baseline
+import os
+import re
+import io
+import json
+import time
+import base64
+import shutil
+import urllib.request
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import os, io, time, uuid, json, shutil, tempfile
-from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Path
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import yt_dlp
+from yt_dlp import YoutubeDL
 
-APP = FastAPI(title="Creator Transcript Fetcher", version="2.2.0")
-
+# -----------------------------
+# Config (via env or sane defaults)
+# -----------------------------
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-EXPIRES_IN_SECONDS = int(os.getenv("EXPIRES_IN_SECONDS", "86400"))  # default 24h
+EXPIRES_IN_SECONDS = int(os.getenv("FILE_EXPIRES_SECONDS", "86400"))  # 24h default
+PORT = int(os.getenv("PORT", "8000"))
 
-# in-memory file registry: token -> {"path":..., "ctype":..., "expires_at":...}
-FILES: Dict[str, Dict[str, Any]] = {}
+# -----------------------------
+# App
+# -----------------------------
+app = FastAPI(title="Creator Transcript Fetcher", version="2.2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ---------- Models ----------
-class TranscriptReq(BaseModel):
-    url_or_id: str
-    langs: str   # e.g., "en,en-US,en-GB,all" or "nl,all"
-    keep_timestamps: bool = False
+# -----------------------------
+# Ephemeral file storage with tokens
+# -----------------------------
+FILES: Dict[str, Dict] = {}  # token -> {path, mime, filename, expires_at}
 
+def _tok() -> str:
+    return base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
 
-# ---------- Helpers ----------
-def _ytdlp_info(url_or_id: str) -> Dict[str, Any]:
-    ydl_opts = {"quiet": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url_or_id, download=False)
+def _now() -> int:
+    return int(time.time())
 
-def _collapse_langs(s: str) -> List[str]:
-    # normalize, remove empties, lower
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    out = []
-    seen = set()
-    for p in parts:
-        p = p.strip()
-        if p.lower() == "all":
-            out.append("all")
-        else:
-            p = p  # keep case like en-US; comparisons use lower()
-        if p not in seen:
-            seen.add(p); out.append(p)
-    if not out:
-        out = ["en","en-US","en-GB","all"]
-    return out
-
-def _pick_caption_track(info: Dict[str, Any], langs: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    Look through manual and auto captions in the order of 'langs'.
-    Each track we return has keys: {"url":..., "ext": ("vtt"|"ttml"|"xml"), "lang":..., "kind":"manual|auto"}.
-    """
-    # Build catalog
-    manual = info.get("subtitles") or {}
-    auto   = info.get("automatic_captions") or {}
-
-    def tracks_from(d: Dict[str, List[Dict[str, Any]]], kind: str):
-        res = []
-        for lang, items in d.items():
-            # choose a webvtt first, else xml/ttml if present
-            choice = None
-            # try vtt
-            for it in items:
-                if (it.get("ext") or "").lower() in ("vtt","webvtt"):
-                    choice = {"url": it["url"], "ext": "vtt", "lang": lang, "kind": kind}
-                    break
-            if not choice:
-                for it in items:
-                    ext = (it.get("ext") or "").lower()
-                    if ext in ("ttml","xml"):
-                        choice = {"url": it["url"], "ext": "xml", "lang": lang, "kind": kind}
-                        break
-            if choice:
-                res.append(choice)
-        return res
-
-    manual_tracks = tracks_from(manual, "manual")
-    auto_tracks   = tracks_from(auto, "auto")
-
-    all_langs_available = {t["lang"] for t in manual_tracks} | {t["lang"] for t in auto_tracks}
-
-    def find_for(code: str) -> Optional[Dict[str, Any]]:
-        # try exact matches in manual, then auto; then case-insensitive fallbacks and startswith matches
-        for pool in (manual_tracks, auto_tracks):
-            for t in pool:
-                if t["lang"] == code: return t
-        lc = code.lower()
-        for pool in (manual_tracks, auto_tracks):
-            for t in pool:
-                if t["lang"].lower() == lc: return t
-        # startswith fallback (e.g., "en" finds "en-US")
-        for pool in (manual_tracks, auto_tracks):
-            for t in pool:
-                if t["lang"].lower().startswith(lc): return t
-        return None
-
-    # user order
-    for code in langs:
-        if code.lower() == "all":
-            # take a reasonable preference order
-            for pref in ["en","en-US","en-GB","nl"]:
-                t = find_for(pref)
-                if t: return t
-            # else: first available
-            if manual_tracks: return manual_tracks[0]
-            if auto_tracks: return auto_tracks[0]
-            return None
-        t = find_for(code)
-        if t: return t
-
-    # nothing found
-    return None
-
-def _download_caption(track: Dict[str, Any]) -> str:
-    """
-    Download caption URL into a temp file, return path to a .vtt or .srt.
-    If xml/ttml, convert to .srt with yt_dlp helper.
-    """
-    url = track["url"]
-    ext = track["ext"]  # "vtt" or "xml"
-    tmp = tempfile.mkdtemp(prefix="caps_")
-    raw_path = os.path.join(tmp, f"caption.{ext}")
-    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-        # Use ydl.urlopen to fetch
-        data = ydl.urlopen(url).read()
-    with open(raw_path, "wb") as f:
-        f.write(data)
-
-    # normalize to .srt and .txt
-    if ext == "vtt":
-        vtt_path = raw_path
-        srt_path = os.path.join(tmp, "caption.srt")
-        # yt-dlp doesn't convert in-place; do a minimal vtt->srt conversion
-        # Simple heuristic for stability: use webvtt-to-srt approach
-        srt_text = _simple_vtt_to_srt(open(vtt_path, "r", encoding="utf-8", errors="ignore").read())
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(srt_text)
-    else:
-        # ext xml/ttml -> produce a naive text (strip tags) and srt-ish timestamps best-effort
-        xml_txt = open(raw_path, "r", encoding="utf-8", errors="ignore").read()
-        srt_path = os.path.join(tmp, "caption.srt")
-        srt_text = _simple_xml_to_srt(xml_txt)
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(srt_text)
-
-    # derive .txt
-    txt_path = os.path.join(tmp, "caption.txt")
-    with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.read().splitlines()
-    # remove indexes and timestamps
-    cleaned = []
-    import re
-    ts_re = re.compile(r"\d{2}:\d{2}:\d{2},\d{3}\s-->\s\d{2}:\d{2}:\d{2},\d{3}")
-    for line in lines:
-        if not line.strip(): 
-            continue
-        if line.strip().isdigit(): 
-            continue
-        if ts_re.match(line): 
-            continue
-        cleaned.append(line)
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(cleaned))
-
-    return tmp  # directory holding caption.srt and caption.txt
-
-
-def _simple_vtt_to_srt(vtt_text: str) -> str:
-    # drop WEBVTT header; replace '.' ms with ','; keep cues
-    lines = vtt_text.splitlines()
-    out = []
-    idx = 1
-    import re
-    tline = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d{3})\s-->\s(\d{2}:\d{2}:\d{2})\.(\d{3})")
-    for line in lines:
-        m = tline.search(line)
-        if m:
-            out.append(str(idx))
-            out.append(f"{m.group(1)},{m.group(2)} --> {m.group(3)},{m.group(4)}")
-            idx += 1
-        elif line.strip().upper().startswith("WEBVTT"):
-            continue
-        else:
-            out.append(line)
-    return "\n".join(out)
-
-def _simple_xml_to_srt(xml_text: str) -> str:
-    # minimal TTML/DFXP parser (best-effort)
-    import re, html
-    # find <p begin="..." end="...">text</p>
-    p_re = re.compile(r'<p[^>]*begin="([^"]+)"[^>]*end="([^"]+)"[^>]*>(.*?)</p>', re.S)
-    def to_srt_ts(t):
-        # 00:00:01.234 or 1.234s
-        if t.endswith("s"):
-            seconds = float(t[:-1])
-        else:
-            parts = t.split(":")
-            if len(parts) == 3:
-                h,m,s = parts
-                seconds = int(h)*3600 + int(m)*60 + float(s)
-            else:
-                seconds = float(t)
-        ms = int(round((seconds - int(seconds)) * 1000))
-        seconds = int(seconds)
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-    out = []
-    idx = 1
-    for m in p_re.finditer(xml_text):
-        out.append(str(idx))
-        out.append(f"{to_srt_ts(m.group(1))} --> {to_srt_ts(m.group(2))}")
-        out.append(html.unescape(re.sub("<.*?>","",m.group(3))).strip())
-        out.append("")
-        idx += 1
-    return "\n".join(out) if out else ""
-
-def _register_file(path: str, ctype: str) -> str:
-    token = uuid.uuid4().hex
-    FILES[token] = {"path": path, "ctype": ctype, "expires_at": time.time() + EXPIRES_IN_SECONDS}
-    return token
-
-def _purge_expired():
-    now = time.time()
-    to_del = [t for t,meta in FILES.items() if meta["expires_at"] <= now]
-    for t in to_del:
+def _purge_expired() -> None:
+    dead = []
+    for t, meta in FILES.items():
+        if meta["expires_at"] <= _now() or not Path(meta["path"]).exists():
+            dead.append(t)
+    for t in dead:
         try:
-            base = os.path.dirname(FILES[t]["path"])
-            shutil.rmtree(base, ignore_errors=True)
-        except:
+            Path(FILES[t]["path"]).unlink(missing_ok=True)
+        except Exception:
             pass
         FILES.pop(t, None)
 
-
-# ---------- Routes ----------
-@APP.get("/health")
-def health():
+def _store_file(path: Path, mime: str, filename: str) -> str:
     _purge_expired()
-    return {"ok": True, "egress_to_youtube": True, "expires_in_seconds_default": EXPIRES_IN_SECONDS}
+    token = _tok()
+    FILES[token] = {
+        "path": str(path),
+        "mime": mime,
+        "filename": filename,
+        "expires_at": _now() + EXPIRES_IN_SECONDS,
+    }
+    return token
 
-@APP.get("/probe")
+def _file_url(token: str) -> str:
+    if not PUBLIC_BASE_URL:
+        return ""
+    return f"{PUBLIC_BASE_URL}/file/{token}"
+
+# -----------------------------
+# Utility
+# -----------------------------
+def pretty_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "0s"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def normalize_lang(code: str) -> str:
+    # normalize "en-US" -> "en", keep region variants for better match later
+    return code.strip().lower()
+
+def ordered_langs(user_langs: str) -> List[str]:
+    """
+    Build a preference list from user input (e.g. "en,en-US,en-GB" or "all").
+    If 'all' appears, we still prioritize English variants first, then others.
+    """
+    # default preference list
+    pref = ["en", "en-us", "en-gb"]
+    if not user_langs:
+        return pref + ["all"]
+
+    parts = [normalize_lang(p) for p in user_langs.split(",") if p.strip()]
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    # if "all" is in requested, append sentinel at the end
+    if "all" not in out:
+        out.append("all")
+    return out
+
+def extract_video_id(url_or_id: str) -> str:
+    # robust YouTube id extraction, accept raw 11-char id too
+    u = url_or_id.strip()
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", u)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", u):
+        return u
+    return u
+
+def yt_info(url: str) -> dict:
+    # Use yt-dlp to *extract* JSON only, no downloads
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "cachedir": False,
+        "ignoreerrors": True,
+        "noprogress": True,
+        "simulate": True,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info and info.get("entries"):
+        info = info["entries"][0]
+    if not isinstance(info, dict):
+        raise HTTPException(404, "Failed to fetch video metadata.")
+    return info
+
+def pick_caption_track(
+    info: dict,
+    pref_langs: List[str]
+) -> Tuple[str, str, str]:
+    """
+    Return (kind, lang_code, url) for the best caption track:
+    - kind: "manual" or "auto"
+    - lang_code: the chosen language code
+    - url: direct VTT (or TTML) URL
+    """
+    subs = info.get("subtitles") or {}
+    autos = info.get("automatic_captions") or {}
+
+    # Build a deterministic set of available languages
+    manual_langs = {normalize_lang(k): k for k in subs.keys()}
+    auto_langs   = {normalize_lang(k): k for k in autos.keys()}
+
+    # Try preferred languages first
+    for want in pref_langs:
+        # "all" means: try any manual first, then any auto
+        if want == "all":
+            # prefer manual
+            for norm, raw in manual_langs.items():
+                cand = subs.get(raw) or []
+                url = best_caption_url(cand)
+                if url:
+                    return ("manual", raw, url)
+            # fallback to auto
+            for norm, raw in auto_langs.items():
+                cand = autos.get(raw) or []
+                url = best_caption_url(cand)
+                if url:
+                    return ("auto", raw, url)
+        else:
+            # look for exact match in manual
+            raw = manual_langs.get(want)
+            if raw:
+                url = best_caption_url(subs.get(raw) or [])
+                if url:
+                    return ("manual", raw, url)
+            # look for exact match in auto
+            raw = auto_langs.get(want)
+            if raw:
+                url = best_caption_url(autos.get(raw) or [])
+                if url:
+                    return ("auto", raw, url)
+
+    # As very last resort, try ANY auto if nothing matched (some videos only have auto)
+    for norm, raw in auto_langs.items():
+        url = best_caption_url(autos.get(raw) or [])
+        if url:
+            return ("auto", raw, url)
+
+    raise HTTPException(
+        404,
+        "No captions were found (manual/auto) in the requested/available languages."
+    )
+
+def best_caption_url(tracks: List[dict]) -> Optional[str]:
+    """
+    Tracks are yt-dlp caption entries with keys like: 'url', 'ext', 'protocol'.
+    Prefer VTT over others, but accept anything (we’ll convert to SRT).
+    """
+    if not tracks:
+        return None
+    # prefer vtt
+    for t in tracks:
+        if (t.get("ext") or "").lower() == "vtt" and t.get("url"):
+            return t["url"]
+    # otherwise first with a URL
+    for t in tracks:
+        if t.get("url"):
+            return t["url"]
+    return None
+
+def http_fetch(url: str) -> bytes:
+    # Fetch with a browser-ish UA to keep CDNs happy
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+def vtt_to_srt_bytes(vtt: bytes) -> bytes:
+    """
+    Convert WebVTT -> SRT using a light normalization;
+    ffmpeg is an alternative, but this avoids spawning extra processes.
+    This handles simple cues well. (Good enough for YT auto/manual tracks.)
+    """
+    text = vtt.decode("utf-8", errors="ignore")
+    # remove WEBVTT header lines
+    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("WEBVTT")]
+    out_lines: List[str] = []
+    idx = 1
+    buf: List[str] = []
+
+    def flush():
+        nonlocal idx, buf, out_lines
+        if not buf:
+            return
+        # Convert timestamps 00:00:00.000 --> 00:00:00,000
+        head = buf[0]
+        head = head.replace(".", ",")
+        out_lines.append(str(idx))
+        out_lines.append(head)
+        for tline in buf[1:]:
+            # strip position/align settings
+            if "-->" not in tline:
+                out_lines.append(re.sub(r"<[^>]+>", "", tline))
+        out_lines.append("")  # blank
+        idx += 1
+        buf = []
+
+    for ln in lines:
+        if re.match(r"^\s*$", ln):
+            flush()
+            continue
+        # time-line looks like: 00:00:01.000 --> 00:00:03.000 ...
+        if "-->" in ln:
+            if buf:
+                flush()
+            buf = [ln.strip()]
+        else:
+            if buf:
+                buf.append(ln)
+    flush()
+    return ("\n".join(out_lines)).encode("utf-8")
+
+def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
+    raw = srt_bytes.decode("utf-8", errors="ignore")
+    blocks = re.split(r"\n\s*\n", raw.strip())
+    lines: List[str] = []
+    for blk in blocks:
+        blk = re.sub(r"^\s*\d+\s*\n", "", blk)  # drop index line
+        # remove the time row
+        m = re.search(r"(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk)
+        text = re.sub(
+            r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
+            "",
+            blk,
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+        if keep_ts and m:
+            ts = m.group(1)
+            lines.append(f"{ts} {text}")
+        else:
+            lines.append(text)
+    out = "\n".join(lines) if keep_ts else " ".join(lines)
+    out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)  # de-dup glitches
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    return out
+
+def as_data_url(mime: str, content: bytes, b64: bool = False) -> str:
+    if b64:
+        return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+    from urllib.parse import quote
+    return f"data:{mime},{quote(content.decode('utf-8'))}"
+
+# -----------------------------
+# Schemas
+# -----------------------------
+class Req(BaseModel):
+    url_or_id: str
+    langs: str = "en,en-US,en-GB,all"
+    keep_timestamps: bool = False
+
+# -----------------------------
+# Endpoints
+# -----------------------------
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "egress_to_youtube": True,
+        "expires_in_seconds_default": EXPIRES_IN_SECONDS,
+    }
+
+@app.get("/probe")
 def probe(url: str):
-    info = _ytdlp_info(url)
-    manual = sorted(list((info.get("subtitles") or {}).keys()))
-    auto   = sorted(list((info.get("automatic_captions") or {}).keys()))
-    # quick timedtext samples (en, en-US, nl) to see status
+    """
+    Quickly shows what yt-dlp *sees* for captions (without downloading).
+    """
+    vid = extract_video_id(url)
+    full = f"https://www.youtube.com/watch?v={vid}" if not url.startswith("http") else url
+    info = yt_info(full)
+    # Summarize availability
+    manual = sorted((info.get("subtitles") or {}).keys())
+    auto = sorted((info.get("automatic_captions") or {}).keys())
     samples = []
-    for lang in ["en","en-US","nl"]:
-        st = 404
-        try:
-            tr = _pick_caption_track(info, [lang])
-            st = 200 if tr else 404
-        except:
-            st = 404
-        samples.append({"lang": lang, "status": st})
-    return {"info": {"title": info.get("title"), "duration": info.get("duration")},
-            "subtitles_keys": manual, "auto_captions_keys": auto,
-            "timedtext_samples": samples}
+    for test in ["en", "en-US", "nl"]:
+        if test in (info.get("subtitles") or {}):
+            samples.append({"lang": test, "status": 200})
+        elif test in (info.get("automatic_captions") or {}):
+            samples.append({"lang": test, "status": 200})
+        else:
+            samples.append({"lang": test, "status": 404})
+    return {
+        "info": {
+            "title": info.get("title"),
+            "duration": info.get("duration") or 0,
+            "subtitles_keys": manual,
+            "auto_captions_keys": auto,
+        },
+        "timedtext_samples": samples,
+    }
 
-@APP.get("/file/{token}")
-def get_file(token: str = Path(...)):
+@app.get("/file/{token}")
+def get_file(token: str):
     meta = FILES.get(token)
     if not meta:
-        raise HTTPException(status_code=404, detail="Expired or invalid token.")
-    if meta["expires_at"] <= time.time():
+        raise HTTPException(404, "Expired or invalid file token.")
+    if meta["expires_at"] <= _now():
         _purge_expired()
-        raise HTTPException(status_code=404, detail="Expired token.")
-    return FileResponse(meta["path"], media_type=meta["ctype"])
+        raise HTTPException(404, "Expired or invalid file token.")
+    p = Path(meta["path"])
+    if not p.exists():
+        _purge_expired()
+        raise HTTPException(404, "File not found.")
+    headers = {"Content-Disposition": f"attachment; filename={json.dumps(meta['filename'])}"}
+    return Response(p.read_bytes(), headers=headers, media_type=meta["mime"])
 
-@APP.post("/transcript")
-def transcript(req: TranscriptReq):
-    _purge_expired()
+@app.post("/transcript")
+def transcript(req: Req):
+    """
+    Stable path:
+      1) Use yt-dlp to EXTRACT metadata & caption track urls.
+      2) Pick best track given req.langs (with 'all' fallback).
+      3) Download the VTT (or other) ourselves.
+      4) Convert to SRT and text.
+      5) Return inline preview + short-lived HTTP links.
+    """
+    vid = extract_video_id(req.url_or_id)
+    url = req.url_or_id if req.url_or_id.startswith("http") else f"https://www.youtube.com/watch?v={vid}"
 
-    info = _ytdlp_info(req.url_or_id)
-    langs = _collapse_langs(req.langs)
-    track = _pick_caption_track(info, langs)
-    if not track:
-        # surface available languages to caller
-        manual = sorted(list((info.get("subtitles") or {}).keys()))
-        auto   = sorted(list((info.get("automatic_captions") or {}).keys()))
-        raise HTTPException(
-            status_code=404,
-            detail=f"No captions were found (manual/auto). Available tracks (non-empty): manual={manual}, auto={auto}. "
-                   f"Try passing langs='all' or a specific code you see listed (e.g., 'nl')."
-        )
+    info = yt_info(url)
+    title = info.get("title", "")
+    channel = info.get("channel") or info.get("uploader", "")
+    published_at = info.get("upload_date", "")
+    if published_at and len(published_at) == 8:
+        published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
+    duration_s = int(info.get("duration") or 0)
 
-    tmpdir = _download_caption(track)
-    srt_path = os.path.join(tmpdir, "caption.srt")
-    txt_path = os.path.join(tmpdir, "caption.txt")
+    # 1) choose caption
+    pref = ordered_langs(req.langs)
+    kind, lang_raw, track_url = pick_caption_track(info, pref)
 
-    # Build preview
-    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-        full_txt = f.read()
-    preview = full_txt[:2500]
-    truncated = len(full_txt) > len(preview)
+    # 2) download caption file
+    vtt_bytes = http_fetch(track_url)
 
-    # register files
-    txt_token = _register_file(txt_path, "text/plain")
-    srt_token = _register_file(srt_path, "application/x-subrip")
+    # 3) convert to SRT
+    srt_bytes = vtt_to_srt_bytes(vtt_bytes)
 
-    pdf_url = ""  # (optional) you can add a PDF generator later
-    title = info.get("title") or ""
-    channel = (info.get("uploader") or info.get("channel")) or ""
-    published = info.get("upload_date")
-    if published and len(published) == 8:
-        published = f"{published[0:4]}-{published[4:6]}-{published[6:8]}"
+    # 4) make plain text
+    text = clean_srt_text(srt_bytes, keep_ts=req.keep_timestamps)
+    text_bytes = text.encode("utf-8")
 
-    duration = info.get("duration") or 0
-    duration_pretty = f"{duration//60}m {duration%60:02d}s" if duration else ""
+    # 5) build files on disk + tokens
+    work = Path("/tmp") / f"cap_{vid}_{int(time.time())}"
+    work.mkdir(parents=True, exist_ok=True)
 
-    base = PUBLIC_BASE_URL or ""  # if empty, URLs will be relative (not recommended)
-    txt_http_url = f"{base}/file/{txt_token}" if base else f"/file/{txt_token}"
-    srt_http_url = f"{base}/file/{srt_token}" if base else f"/file/{srt_token}"
+    srt_path = work / f"{vid}_{lang_raw}.srt"
+    srt_path.write_bytes(srt_bytes)
+
+    txt_path = work / f"{vid}_{lang_raw}.txt"
+    txt_path.write_bytes(text_bytes)
+
+    # Optional PDF (small + robust)
+    pdf_path = work / f"{vid}_{lang_raw}.pdf"
+    pdf_bytes = None
+    try:
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=12)
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        header = f"{title}\n{channel} · {published_at}\nhttps://www.youtube.com/watch?v={vid}\n\n"
+        for line in (header + text).split("\n"):
+            pdf.multi_cell(0, 6, line)
+        pdf.output(str(pdf_path))
+        pdf_bytes = pdf_path.read_bytes()
+    except Exception:
+        pdf_bytes = None
+
+    # tokenized HTTP links
+    srt_tok = _store_file(srt_path, "text/plain", srt_path.name)
+    txt_tok = _store_file(txt_path, "text/plain", txt_path.name)
+    pdf_tok = _store_file(pdf_path, "application/pdf", pdf_path.name) if pdf_bytes else None
 
     return {
         "title": title,
         "channel": channel,
-        "published_at": published,
-        "duration_s": duration,
-        "duration_pretty": duration_pretty,
-        "video_id": info.get("id"),
-        "captions_lang": track["lang"],
-        "captions_kind": track["kind"],
-        "preview_text": preview,
-        "truncated": truncated,
-        "txt_http_url": txt_http_url,
-        "srt_http_url": srt_http_url,
-        "pdf_http_url": pdf_url,
+        "published_at": published_at,
+        "duration_s": duration_s,
+        "duration_pretty": pretty_duration(duration_s),
+        "video_id": vid,
+        "captions_kind": kind,           # "manual" | "auto"
+        "captions_lang": lang_raw,       # e.g. "en" | "en-US" | "nl"
+        "preview_text": text[:3000],
+        "truncated": len(text) > 3000,
+        "txt_http_url": _file_url(txt_tok),
+        "srt_http_url": _file_url(srt_tok),
+        "pdf_http_url": _file_url(pdf_tok) if pdf_tok else "",
         "links_expire_in_seconds": EXPIRES_IN_SECONDS,
-        "links_expire_human": f"{EXPIRES_IN_SECONDS//3600}h" if EXPIRES_IN_SECONDS>=3600 else f"{EXPIRES_IN_SECONDS//60}m",
     }
-
-
-# ---------- Run (for local) ----------
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(APP, host="0.0.0.0", port=int(os.getenv("PORT","8080")))
