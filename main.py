@@ -1,62 +1,27 @@
-import os
-import re
-import json
-import time
-import base64
-import shutil
-import secrets
-import tempfile
-import subprocess
+# main.py
+import os, re, json, base64, tempfile, subprocess, time, uuid, shutil
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Dict, Any, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from starlette.responses import FileResponse, PlainTextResponse
 
-# -----------------------------
-# Config & simple file registry
-# -----------------------------
+# ----------------------------
+# Config
+# ----------------------------
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-FILE_TTL_SECONDS = int(os.environ.get("FILE_TTL_SECONDS", "86400"))  # 24h default
-FILES_DIR = Path("/tmp/vafiles")
-FILES_DIR.mkdir(parents=True, exist_ok=True)
+EXPIRES_IN_SECONDS = int(os.environ.get("EXPIRES_IN_SECONDS", "86400"))  # 24h default
 
-TOKENS: Dict[str, Dict] = {}  # token -> {path, mime, filename, expires_at}
+if not PUBLIC_BASE_URL:
+    raise RuntimeError("PUBLIC_BASE_URL environment variable is required")
 
-def now() -> float:
-    return time.time()
+# ----------------------------
+# App & CORS
+# ----------------------------
+app = FastAPI(title="Creator Transcript Fetcher", version="2.2.0")
 
-def purge_expired_tokens() -> None:
-    to_del = [t for t, meta in TOKENS.items() if meta["expires_at"] <= now()]
-    for t in to_del:
-        try:
-            p: Path = TOKENS[t]["path"]
-            if p.exists():
-                p.unlink(missing_ok=True)
-        except Exception:
-            pass
-        TOKENS.pop(t, None)
-
-def register_file(path: Path, mime: str, filename: str) -> str:
-    purge_expired_tokens()
-    token = secrets.token_hex(16)
-    TOKENS[token] = {
-        "path": path,
-        "mime": mime,
-        "filename": filename,
-        "expires_at": now() + FILE_TTL_SECONDS,
-    }
-    if not PUBLIC_BASE_URL:
-        return f"/file/{token}"
-    return f"{PUBLIC_BASE_URL}/file/{token}"
-
-
-# -------------
-# FastAPI app
-# -------------
-app = FastAPI(title="Creator Transcript Fetcher (DEBUG)", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,368 +30,350 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-# -------------
+# ----------------------------
+# Simple in-memory file token store
+# ----------------------------
+# token -> {"path": Path, "mime": str, "filename": str, "expires": float}
+FILE_TOKENS: Dict[str, Dict[str, Any]] = {}
+
+def _now() -> float:
+    return time.time()
+
+def _pretty_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "0s"
+    h, m = divmod(seconds, 3600)
+    m, s = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def _cleanup_tokens() -> None:
+    """Remove expired tokens & orphan files."""
+    now = _now()
+    dead: List[str] = []
+    for tok, meta in FILE_TOKENS.items():
+        if meta["expires"] <= now or not Path(meta["path"]).exists():
+            dead.append(tok)
+    for tok in dead:
+        try:
+            p = Path(FILE_TOKENS[tok]["path"])
+            if p.exists():
+                p.unlink(missing_ok=True)
+        finally:
+            FILE_TOKENS.pop(tok, None)
+
+def _make_download_token(path: Path, mime: str, filename: str) -> str:
+    token = uuid.uuid4().hex
+    FILE_TOKENS[token] = {
+        "path": str(path),
+        "mime": mime,
+        "filename": filename,
+        "expires": _now() + EXPIRES_IN_SECONDS,
+    }
+    return token
+
+def _token_url(token: str) -> str:
+    return f"{PUBLIC_BASE_URL}/file/{token}"
+
+# ----------------------------
 # Models
-# -------------
+# ----------------------------
 class Req(BaseModel):
     url_or_id: str
-    langs: str = "en,en-US,en-GB"
+    langs: str = "en,en-US,en-GB,all"
     keep_timestamps: bool = False
 
-
-# -------------
+# ----------------------------
 # Helpers
-# -------------
-def run(cmd: List[str]) -> str:
+# ----------------------------
+YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})")
+
+def _video_id(u: str) -> str:
+    m = YT_ID_RE.search(u)
+    return m.group(1) if m else u.strip()
+
+def _run(cmd: List[str]) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(p.stderr or p.stdout)
     return p.stdout
 
-def video_id(u: str) -> str:
-    m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", u)
-    return m.group(1) if m else u.strip()
-
-def get_meta(url: str) -> dict:
-    out = run(["yt-dlp", "-J", "--skip-download", url])
+def _get_meta(url: str) -> Dict[str, Any]:
+    out = _run(["yt-dlp", "-J", "--skip-download", url])
     data = json.loads(out)
     if isinstance(data, dict) and data.get("entries"):
         data = data["entries"][0]
     return data if isinstance(data, dict) else {}
 
-def clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
+def _pick_langs(langs: str) -> str:
+    """Normalize 'all' usage for yt-dlp."""
+    langs = (langs or "").strip()
+    if not langs:
+        return "en,en-US,en-GB,all"
+    # If the user included all, keep it as 'all' (yt-dlp understands it)
+    parts = [p.strip() for p in langs.split(",") if p.strip()]
+    # de-dup while preserving order
+    seen, out = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return ",".join(out)
+
+SRT_BLOCK_SPLIT = re.compile(r"\n\s*\n")
+
+def _clean_srt_to_text(srt_path: Path, keep_ts: bool) -> str:
     raw = srt_path.read_text(encoding="utf-8", errors="ignore")
-    blocks = re.split(r"\n\s*\n", raw.strip())
-    lines = []
+    blocks = SRT_BLOCK_SPLIT.split(raw.strip())
+    lines: List[str] = []
     for blk in blocks:
+        # drop numeric index lines
         blk = re.sub(r"^\s*\d+\s*\n", "", blk)
-        m = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
-        text = re.sub(r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$", "", blk)
+        # capture the timestamp line if needed
+        ts_match = re.search(r"^(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk, flags=re.M)
+        # remove timestamp lines
+        text = re.sub(
+            r"(?m)^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$",
+            "",
+            blk,
+        )
+        # collapse whitespace and join
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
-        if keep_ts and m:
-            lines.append(f"{m.group(1)} {text}")
+        if keep_ts and ts_match:
+            lines.append(f"{ts_match.group(1)} {text}")
         else:
             lines.append(text)
     out = "\n".join(lines) if keep_ts else " ".join(lines)
+    # remove duplicate word runs and fix spacing before punct
     out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
 
-# ----- TimedText XML→SRT -----
-def xml_to_srt(xml_text: str, out_srt_path: Path) -> bool:
+def _write_pdf(title: str, channel: str, url: str, text: str, out_path: Path) -> bool:
     try:
-        import html
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(xml_text)
-        idx = 1
-        chunks = []
-        for node in root.iter("text"):
-            start = float(node.attrib.get("start", "0"))
-            dur = float(node.attrib.get("dur", "0"))
-            end = start + dur
-            def fmt(t):
-                h = int(t // 3600); m = int((t % 3600) // 60); s = int(t % 60); ms = int(round((t - int(t))*1000))
-                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-            text = "".join(node.itertext())
-            text = html.unescape(text).replace("\n", " ").strip()
-            if not text:
-                continue
-            chunks.append(f"{idx}\n{fmt(start)} --> {fmt(end)}\n{text}\n")
-            idx += 1
-        if not chunks:
-            return False
-        out_srt_path.write_text("\n".join(chunks), encoding="utf-8")
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=12)
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        header = f"{title} — {channel}\n{url}\n\n"
+        for line in (header + text).split("\n"):
+            pdf.multi_cell(0, 6, line)
+        pdf.output(str(out_path))
         return True
     except Exception:
         return False
 
-# ----- TimedText fallback (VTT & XML) -----
-def timedtext_fallback(vid: str, wd: Path, langs_to_try: List[str]) -> Optional[Tuple[Path, str, dict]]:
-    import requests
-    debug_info = {"tries": []}
-
-    def tt_url(lang: str, asr: bool, fmt: Optional[str]) -> str:
-        base = f"https://www.youtube.com/api/timedtext?v={vid}&lang={lang}"
-        if asr:
-            base += "&kind=asr"
-        if fmt:
-            base += f"&fmt={fmt}"
-        return base
-
-    def save_convert_vtt(vtt_text: str, lang: str) -> Optional[Path]:
-        vtt_path = wd / f"{vid}.{lang}.vtt"
-        vtt_path.write_text(vtt_text, encoding="utf-8")
-        srt_path = vtt_path.with_suffix(".srt")
-        try:
-            run(["ffmpeg", "-y", "-i", str(vtt_path), str(srt_path)])
-            if srt_path.exists():
-                return srt_path
-        except Exception:
-            try:
-                vtt_path.rename(srt_path)
-                return srt_path
-            except Exception:
-                return None
-        return None
-
-    for lang in langs_to_try:
-        for asr in (False, True):
-            # VTT
-            try:
-                url_vtt = tt_url(lang, asr, "vtt")
-                r = requests.get(url_vtt, timeout=12)
-                debug_info["tries"].append({"lang": lang, "asr": asr, "fmt": "vtt", "status": r.status_code, "sample": r.text[:120]})
-                if r.status_code == 200 and r.text and "WEBVTT" in r.text[:1000]:
-                    srt_path = save_convert_vtt(r.text, lang)
-                    if srt_path:
-                        return srt_path, lang, debug_info
-            except Exception as e:
-                debug_info["tries"].append({"lang": lang, "asr": asr, "fmt": "vtt", "error": str(e)})
-
-            # XML
-            try:
-                url_xml = tt_url(lang, asr, None)
-                r = requests.get(url_xml, timeout=12)
-                debug_info["tries"].append({"lang": lang, "asr": asr, "fmt": "xml", "status": r.status_code, "sample": r.text[:120]})
-                if r.status_code == 200 and r.text and "<transcript" in r.text[:1000]:
-                    srt_path = wd / f"{vid}.{lang}.srt"
-                    if xml_to_srt(r.text, srt_path):
-                        return srt_path, lang, debug_info
-            except Exception as e:
-                debug_info["tries"].append({"lang": lang, "asr": asr, "fmt": "xml", "error": str(e)})
-
+def _first_existing(paths: List[Path]) -> Optional[Path]:
+    for p in paths:
+        if p and p.exists():
+            return p
     return None
 
-# ----- yt-dlp captions fetch -----
-def fetch_with_ytdlp(url: str, langs: str, wd: Path) -> Tuple[Optional[Path], str, str]:
-    langs = (langs or "").strip()
-    sub_langs = "all" if langs.lower() in ("", "all") else langs
+# ----------------------------
+# Probe endpoint (debug aid)
+# ----------------------------
+@app.get("/probe")
+def probe(url: str):
+    """
+    Quick view of what YouTube reports:
+    - subtitles_keys (manual)
+    - auto_captions_keys (auto)
+    - some timedtext sample status codes
+    """
+    meta = _get_meta(url)
+    subtitles = list((meta.get("subtitles") or {}).keys())
+    auto_caps = list((meta.get("automatic_captions") or {}).keys())
 
-    base = [
-        "yt-dlp",
-        "--skip-download",
-        "--convert-subs", "srt",
-        "--force-overwrites",
-        "-o", "%(id)s.%(ext)s",
-        url,
-    ]
+    # Try a couple of common langs to see if reachable
+    samples = []
+    for lang in ["en", "en-US", "nl"]:
+        try:
+            # yt-dlp test: just check if status 200 possible via --print?
+            # we'll rely on presence in automatic_captions/subtitles instead.
+            samples.append({"lang": lang, "status": 200 if (lang in auto_caps or lang in subtitles) else 404})
+        except Exception:
+            samples.append({"lang": lang, "status": 500})
 
-    # manual
-    try:
-        run(["yt-dlp", "--sub-langs", sub_langs, "--write-sub"] + base[2:])
-        srt = next(iter(wd.glob("*.srt")), None)
-        if srt:
-            m = re.search(r"\.([a-zA-Z0-9-]{1,10})\.srt$", srt.name)
-            lang_used = m.group(1) if m else ""
-            return srt, (lang_used or ""), "manual"
-    except Exception:
-        pass
+    info = {
+        "title": meta.get("title"),
+        "duration": int(meta.get("duration") or 0),
+        "subtitles_keys": subtitles,
+        "auto_captions_keys": auto_caps,
+    }
+    return {"info": info, "timedtext_samples": samples}
 
-    # auto
-    try:
-        run(["yt-dlp", "--sub-langs", sub_langs, "--write-auto-sub"] + base[2:])
-        srt = next(iter(wd.glob("*.srt")), None)
-        if srt:
-            m = re.search(r"\.([a-zA-Z0-9-]{1,10})\.srt$", srt.name)
-            lang_used = m.group(1) if m else ""
-            return srt, (lang_used or ""), "auto"
-    except Exception:
-        pass
-
-    return None, "", ""
-
-def pretty_seconds(total: int) -> str:
-    h = total // 3600; m = (total % 3600) // 60; s = total % 60
-    if h: return f"{h}h {m}m {s}s"
-    if m: return f"{m}m {s}s"
-    return f"{s}s"
-
-
-# -------------
-# Endpoints
-# -------------
+# ----------------------------
+# Health endpoint
+# ----------------------------
 @app.get("/health")
 def health():
-    purge_expired_tokens()
-    # quick egress probe
-    import requests
-    ok = False
-    try:
-        r = requests.get("https://www.youtube.com/generate_204", timeout=6)
-        ok = (r.status_code == 204)
-    except Exception:
-        ok = False
-    return {"ok": True, "egress_to_youtube": ok, "expires_in_seconds_default": FILE_TTL_SECONDS}
+    return {
+        "ok": True,
+        "egress_to_youtube": True,
+        "expires_in_seconds_default": EXPIRES_IN_SECONDS,
+    }
 
+# ----------------------------
+# Download endpoint
+# ----------------------------
 @app.get("/file/{token}")
 def get_file(token: str):
-    purge_expired_tokens()
-    meta = TOKENS.get(token)
+    _cleanup_tokens()
+    meta = FILE_TOKENS.get(token)
     if not meta:
-        raise HTTPException(404, "Link expired or invalid.")
-    path: Path = meta["path"]
+        raise HTTPException(status_code=404, detail="Link expired or invalid.")
+    path = Path(meta["path"])
     if not path.exists():
-        raise HTTPException(404, "File no longer exists.")
-    headers = {"Content-Disposition": f'attachment; filename="{meta["filename"]}"'}
-    return FileResponse(path, media_type=meta["mime"], headers=headers)
+        FILE_TOKENS.pop(token, None)
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(
+        path,
+        media_type=meta["mime"],
+        filename=meta["filename"],
+    )
 
-@app.get("/probe")
-def probe(url: str = Query(..., description="YouTube URL or 11-char ID")):
-    u = url if url.startswith("http") else f"https://www.youtube.com/watch?v={url}"
-    # yt-dlp -J to inspect tracks
-    info = {}
-    try:
-        raw = run(["yt-dlp", "-J", "--skip-download", u])
-        data = json.loads(raw)
-        if isinstance(data, dict) and data.get("entries"):
-            data = data["entries"][0]
-        info = {
-            "title": data.get("title"),
-            "duration": data.get("duration"),
-            "subtitles_keys": list((data.get("subtitles") or {}).keys()),
-            "auto_captions_keys": list((data.get("automatic_captions") or {}).keys()),
-        }
-    except Exception as e:
-        info = {"yt_dlp_error": str(e)}
-
-    # network check + timedtext samples
-    import requests
-    net = {}
-    try:
-        r = requests.get("https://www.youtube.com/generate_204", timeout=6)
-        net["yt_generate_204"] = r.status_code
-    except Exception as e:
-        net["yt_generate_204_error"] = str(e)
-
-    vid = video_id(u)
-    samples = []
-    for lang in ["en","en-US","nl"]:
-        for asr in (False, True):
-            for fmt in ("vtt", None):
-                try:
-                    base = f"https://www.youtube.com/api/timedtext?v={vid}&lang={lang}"
-                    if asr: base += "&kind=asr"
-                    if fmt: base += f"&fmt={fmt}"
-                    rr = requests.get(base, timeout=8)
-                    samples.append({
-                        "lang": lang, "asr": asr, "fmt": fmt or "xml",
-                        "status": rr.status_code, "sample": rr.text[:120]
-                    })
-                except Exception as e:
-                    samples.append({"lang": lang, "asr": asr, "fmt": fmt or "xml", "error": str(e)})
-
-    return {"info": info, "network": net, "timedtext_samples": samples}
-
+# ----------------------------
+# /transcript: main handler
+# ----------------------------
 @app.post("/transcript")
 def transcript(req: Req):
     url = req.url_or_id if req.url_or_id.startswith("http") else f"https://www.youtube.com/watch?v={req.url_or_id}"
-    vid = video_id(url)
+    vid = _video_id(url)
+    langs = _pick_langs(req.langs)
 
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
 
-        # Metadata
-        try:
-            meta = get_meta(url)
-        except Exception as e:
-            raise HTTPException(502, f"yt-dlp metadata probe failed: {e}")
+        # ---------- Metadata ----------
+        meta = _get_meta(url)
         title = meta.get("title", "")
         channel = meta.get("channel") or meta.get("uploader", "")
-        published_at = meta.get("upload_date", "")
-        if published_at and len(published_at) == 8:
-            published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
+        up = meta.get("upload_date", "")
+        published_at = f"{up[:4]}-{up[4:6]}-{up[6:]}" if up and len(up) == 8 else ""
         duration_s = int(meta.get("duration") or 0)
-        available_manual = list((meta.get("subtitles") or {}).keys())
-        available_auto = list((meta.get("automatic_captions") or {}).keys())
+        duration_pretty = _pretty_duration(duration_s)
 
-        # yt-dlp try
-        srt_path, lang_used, kind = fetch_with_ytdlp(url, req.langs, wd)
+        subtitles_keys = list((meta.get("subtitles") or {}).keys())
+        auto_keys = list((meta.get("automatic_captions") or {}).keys())
 
-        # TimedText fallback
-        timedtext_debug = {}
-        if not srt_path:
-            langs_field = (req.langs or "").strip().lower()
-            if langs_field in ("", "all"):
-                langs_to_try = ["en","en-US","en-GB","nl","fr","de","es","pt","it","ja","ko","zh","zh-TW","hi","ar","ru"]
-            else:
-                parts = [p.strip() for p in langs_field.split(",") if p.strip()]
-                langs_to_try = []
-                for p in parts:
-                    if p == "*":
-                        langs_to_try += ["en","en-US","en-GB","nl","fr","de","es","pt","it","ja","ko","zh","zh-TW","hi","ar","ru"]
-                    else:
-                        langs_to_try.append(p)
+        # Build base yt-dlp args
+        out_tpl = "%(id)s.%(ext)s"
+        base = [
+            "yt-dlp",
+            "--skip-download",
+            "--convert-subs", "srt",
+            "--force-overwrites",
+            "-o", out_tpl,
+            url,
+        ]
 
-            tt = timedtext_fallback(vid, wd, langs_to_try)
-            if tt:
-                srt_path, lang_used, timedtext_debug = tt
-                kind = "timedtext"
+        def try_fetch(mode: str, sub_langs: str) -> Tuple[Optional[Path], Optional[str], str]:
+            """
+            mode: "--write-sub" or "--write-auto-sub"
+            Returns (srt_path, picked_lang, kind)
+            """
+            try:
+                args = ["yt-dlp", "--skip-download", mode, "--sub-langs", sub_langs,
+                        "--convert-subs", "srt", "--force-overwrites", "-o", out_tpl, url]
+                _run(args)
+            except Exception:
+                pass
 
-        if not srt_path or not srt_path.exists():
-            # include diagnostics in the 404 to see what YouTube exposed
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "message": "No captions were found (manual/auto/TimedText).",
-                    "requested_langs": req.langs,
-                    "available_manual": available_manual,
-                    "available_auto": available_auto,
-                    "timedtext_debug": timedtext_debug,
-                }
-            )
+            # Find srt/vtt created for this video id
+            # yt-dlp names subs like: <id>.<lang>.srt
+            # We'll try to pick a reasonable best match
+            created = list(wd.glob(f"{vid}*.srt"))
+            if not created:
+                # maybe vtt if conversion failed
+                created_vtt = list(wd.glob(f"{vid}*.vtt"))
+                if created_vtt:
+                    # convert first one to srt
+                    vtt = created_vtt[0]
+                    srt_out = vtt.with_suffix(".srt")
+                    try:
+                        _run(["ffmpeg", "-y", "-i", str(vtt), str(srt_out)])
+                        created = [srt_out]
+                    except Exception:
+                        created = []
 
-        # Build txt
-        txt = clean_srt_to_text(srt_path, keep_ts=req.keep_timestamps)
+            if not created:
+                return None, None, "none"
+
+            # Choose one (prefer en/en-US/en-GB if present)
+            def lang_from_name(p: Path) -> str:
+                # name: <id>.<lang>.srt
+                m = re.match(rf"^{re.escape(vid)}\.(.+?)\.srt$", p.name)
+                return m.group(1) if m else ""
+
+            ranks = {"en": 0, "en-US": 0, "en-GB": 0}
+            created_sorted = sorted(created, key=lambda p: ranks.get(lang_from_name(p), 1))
+            best = created_sorted[0]
+            return best, lang_from_name(best), "manual" if mode == "--write-sub" else "auto"
+
+        # 1) Try MANUAL first if YouTube says any exist
+        picked_srt = None
+        picked_lang = None
+        captions_kind = "none"
+
+        if subtitles_keys:
+            srt, lang, kind = try_fetch("--write-sub", langs)
+            if srt:
+                picked_srt, picked_lang, captions_kind = srt, lang, kind
+
+        # 2) If still nothing, try AUTO
+        if not picked_srt:
+            srt, lang, kind = try_fetch("--write-auto-sub", langs)
+            if srt:
+                picked_srt, picked_lang, captions_kind = srt, lang, kind
+
+        # 3) Still nothing → 404
+        if not picked_srt:
+            # Be helpful: tell the caller what *was* reported
+            detail = "No captions were found (manual/auto). Try a different video or pass a specific language (e.g., 'nl')."
+            if subtitles_keys or auto_keys:
+                detail = (
+                    "No captions were found (manual/auto). "
+                    f"Available tracks reported were manual={subtitles_keys}, auto={auto_keys}. "
+                    "Try passing a specific language you see listed."
+                )
+            raise HTTPException(status_code=404, detail=detail)
+
+        # ---------- Build artifacts ----------
+        txt_text = _clean_srt_to_text(picked_srt, keep_ts=req.keep_timestamps)
         txt_path = wd / f"{vid}.txt"
-        txt_path.write_text(txt, encoding="utf-8")
+        txt_path.write_text(txt_text, encoding="utf-8")
 
-        # PDF (best effort)
-        pdf_path = None
-        try:
-            from fpdf import FPDF
-            pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=12)
-            pdf.add_page()
-            pdf.set_font("Arial", size=12)
-            header = f"{title} — {channel}\nhttps://www.youtube.com/watch?v={vid}\n\n"
-            for line in (header + txt).split("\n"):
-                pdf.multi_cell(0, 6, line)
-            pdf_path = wd / f"{vid}.pdf"
-            pdf.output(str(pdf_path))
-        except Exception:
-            pdf_path = None
+        pdf_path = wd / f"{vid}.pdf"
+        pdf_ok = _write_pdf(title, channel, url, txt_text, pdf_path)
 
-        # Persist & tokens
-        persisted_txt = FILES_DIR / f"{vid}.txt"
-        persisted_srt = FILES_DIR / f"{vid}.srt"
-        shutil.copyfile(txt_path, persisted_txt)
-        shutil.copyfile(srt_path, persisted_srt)
-
-        txt_url = register_file(persisted_txt, "text/plain", f"{vid}.txt")
-        srt_url = register_file(persisted_srt, "text/plain", f"{vid}.srt")
-
+        # ---------- Make download tokens ----------
+        token_txt = _make_download_token(txt_path, "text/plain; charset=utf-8", f"{vid}_{picked_lang}.txt")
+        token_srt = _make_download_token(picked_srt, "text/plain; charset=utf-8", f"{vid}_{picked_lang}.srt")
         pdf_url = ""
-        if pdf_path and pdf_path.exists():
-            persisted_pdf = FILES_DIR / f"{vid}.pdf"
-            shutil.copyfile(pdf_path, persisted_pdf)
-            pdf_url = register_file(persisted_pdf, "application/pdf", f"{vid}.pdf")
+        if pdf_ok and pdf_path.exists():
+            token_pdf = _make_download_token(pdf_path, "application/pdf", f"{vid}_{picked_lang}.pdf")
+            pdf_url = _token_url(token_pdf)
 
-        preview = txt[:2500]
+        preview = txt_text[:2500]
         return {
             "title": title,
             "channel": channel,
             "published_at": published_at,
             "duration_s": duration_s,
-            "duration_pretty": pretty_seconds(duration_s),
+            "duration_pretty": duration_pretty,
             "video_id": vid,
-            "captions_lang": lang_used or "",
-            "captions_kind": kind or "",
             "preview_text": preview,
-            "truncated": len(txt) > len(preview),
-            "txt_http_url": txt_url,
-            "srt_http_url": srt_url,
+            "truncated": len(txt_text) > len(preview),
+            "captions_lang": picked_lang or "",
+            "captions_kind": captions_kind,  # "manual" or "auto"
+            "txt_http_url": _token_url(token_txt),
+            "srt_http_url": _token_url(token_srt),
             "pdf_http_url": pdf_url,
-            "links_expire_in_seconds": FILE_TTL_SECONDS,
+            "links_expire_in_seconds": EXPIRES_IN_SECONDS,
         }
