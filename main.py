@@ -8,6 +8,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+from urllib.parse import urljoin
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -18,8 +19,8 @@ from starlette.responses import Response
 # ------------------------------
 # In-memory file store (expiring)
 # ------------------------------
-# CHANGED: default TTL -> 24h, and allow env override
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "86400"))  # 24 hours
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # e.g. https://your-domain.tld
 _file_store: Dict[str, Dict[str, Any]] = {}  # token -> {content, mime, exp, filename}
 
 def _store_file(content: bytes, mime: str, filename: str) -> str:
@@ -37,6 +38,16 @@ def _cleanup_files():
     expired = [t for t, v in _file_store.items() if v["exp"] < now]
     for t in expired:
         _file_store.pop(t, None)
+
+def _abs_url(path: str) -> str:
+    """
+    Build an absolute URL for download links so they work from ChatGPT.
+    If PUBLIC_BASE_URL is unset, fall back to returning the raw path
+    (works in Swagger on the same origin).
+    """
+    if not PUBLIC_BASE_URL:
+        return path
+    return urljoin(PUBLIC_BASE_URL + "/", path.lstrip("/"))
 
 # -------------
 # FastAPI setup
@@ -71,15 +82,11 @@ def extract_video_id(u: str) -> str:
     m = ID_RE.search(u)
     if m:
         return m.group(1)
-    # If user already gave an 11-char ID, accept it.
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", u):
         return u
     return u  # As last resort; yt-dlp will still try the full URL
 
 def run(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
-    """
-    Run a command and capture returncode, stdout, stderr (as text).
-    """
     p = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -89,9 +96,6 @@ def run(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
     return p.returncode, p.stdout, p.stderr
 
 def get_meta_with_ytdlp(url: str, workdir: Path, debug: List[str]) -> Dict[str, Any]:
-    """
-    Use yt-dlp -J to fetch metadata. Return a dict or {} on failure.
-    """
     cmd = ["yt-dlp", "-J", "--skip-download", url]
     rc, out, err = run(cmd, cwd=workdir)
     debug.append(f"[meta] rc={rc}\nCMD: {' '.join(cmd)}\nSTDERR:\n{err[:2000]}")
@@ -107,10 +111,6 @@ def get_meta_with_ytdlp(url: str, workdir: Path, debug: List[str]) -> Dict[str, 
         return {}
 
 def clean_srt_to_text(srt_text: str, keep_ts: bool) -> str:
-    """
-    Simple SRT cleaner: removes index/timestamp lines.
-    Keeps timestamps if keep_ts=True (first timestamp per block).
-    """
     blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
     lines: List[str] = []
     ts_re = re.compile(r"^\s*\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$", re.M)
@@ -131,10 +131,6 @@ def clean_srt_to_text(srt_text: str, keep_ts: bool) -> str:
     return ("\n".join(lines)) if keep_ts else (" ".join(lines))
 
 def direct_timedtext_probe(vid: str, langs_csv: str, debug: List[str]) -> Dict[str, Any]:
-    """
-    Probe YouTube timedtext endpoint directly for the first language in langs.
-    Returns status, length, and url tested—purely for debugging visibility.
-    """
     lang = (langs_csv.split(",")[0] or "en").strip()
     url = f"https://www.youtube.com/api/timedtext?lang={lang}&v={vid}"
     try:
@@ -145,13 +141,6 @@ def direct_timedtext_probe(vid: str, langs_csv: str, debug: List[str]) -> Dict[s
         return {"url": url, "status": -1, "len": 0}
 
 def try_subs(url: str, workdir: Path, langs: str, debug: List[str]) -> Tuple[Optional[Path], Dict[str, Any]]:
-    """
-    Attempt to download subtitles with yt-dlp:
-      1) manual subs, given langs
-      2) auto subs, given langs
-      3) auto subs, wildcard 'en,*' (last resort)
-    Returns (srt_path, attempt_log_dict).
-    """
     attempt_log: Dict[str, Any] = {"attempts": []}
 
     def _run_attempt(label: str, write_flag: str, sub_lang: str) -> Optional[Path]:
@@ -179,20 +168,16 @@ def try_subs(url: str, workdir: Path, langs: str, debug: List[str]) -> Tuple[Opt
     p = _run_attempt("manual/requested", "--write-sub", langs)
     if p:
         return p, attempt_log
-
     p = _run_attempt("auto/requested", "--write-auto-sub", langs)
     if p:
         return p, attempt_log
-
     p = _run_attempt("auto/wildcard", "--write-auto-sub", "en,*en*")
     if p:
         return p, attempt_log
 
     return None, attempt_log
 
-# NEW: make text safe for core PDF fonts (latin-1)
 def _pdf_sanitize(s: str) -> str:
-    # Replace non-latin-1 chars with a close ASCII approximation (or drop).
     normalized = unicodedata.normalize("NFKD", s)
     return normalized.encode("latin-1", "ignore").decode("latin-1")
 
@@ -202,7 +187,12 @@ def _pdf_sanitize(s: str) -> str:
 @app.get("/health")
 def health():
     _cleanup_files()
-    return {"ok": True, "time": time.time(), "ttl_seconds": FILE_TTL_SECONDS}
+    return {
+        "ok": True,
+        "time": time.time(),
+        "ttl_seconds": FILE_TTL_SECONDS,
+        "base": PUBLIC_BASE_URL or "(relative links)"
+    }
 
 @app.get("/file/{token}")
 def get_file(token: str):
@@ -222,17 +212,14 @@ def transcript(req: Req):
     debug: List[str] = []
     _cleanup_files()
 
-    # Extract a best-effort VideoID for visibility
     vid = extract_video_id(req.url_or_id)
     debug.append(f"[extract] input='{req.url_or_id}' -> video_id='{vid}'")
 
-    # Timedtext probe (pure visibility into public availability)
     tt = direct_timedtext_probe(vid, req.langs, debug)
 
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
 
-        # Fetch metadata
         meta = get_meta_with_ytdlp(req.url_or_id, wd, debug)
         title = meta.get("title", "")
         channel = meta.get("channel") or meta.get("uploader", "")
@@ -242,9 +229,7 @@ def transcript(req: Req):
         duration_s = int(meta.get("duration") or 0)
         meta_vid = meta.get("id") or vid
 
-        # Try to obtain SRT
         srt_path, attempts = try_subs(req.url_or_id, wd, req.langs, debug)
-
         if not srt_path or not srt_path.exists():
             detail = {
                 "message": "Failed to obtain subtitles.",
@@ -255,29 +240,23 @@ def transcript(req: Req):
             }
             raise HTTPException(status_code=404, detail=detail)
 
-        # Read SRT & create TXT
         srt_bytes = srt_path.read_bytes()
         srt_text = srt_bytes.decode("utf-8", errors="ignore")
         txt_text = clean_srt_to_text(srt_text, keep_ts=req.keep_timestamps)
         txt_bytes = txt_text.encode("utf-8")
 
-        # Robust PDF creation (no trimming — paginate & wrap)
         pdf_bytes = b""
         pdf_http_url = ""
         pdf_error = ""
         try:
-            from fpdf import FPDF  # core fonts only (latin-1)
+            from fpdf import FPDF
             pdf = FPDF()
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-            pdf.set_font("Helvetica", size=12)  # CHANGED: core font always available
+            pdf.set_font("Helvetica", size=12)
 
             header = f"{title} — {channel}\nhttps://www.youtube.com/watch?v={meta_vid}\n\n"
-            # Sanitize for latin-1; multi_cell will wrap and paginate automatically.
             safe_text = _pdf_sanitize(header + txt_text)
-
-            # Write in safe chunks to avoid any weird extremely long line edge cases
-            # (this does NOT trim content—just writes sequentially).
             for paragraph in safe_text.split("\n"):
                 pdf.multi_cell(0, 6, paragraph)
 
@@ -288,8 +267,6 @@ def transcript(req: Req):
             pdf_error = f"{type(e).__name__}: {e}"
             debug.append(f"[pdf] generation failed: {pdf_error}")
 
-        # Create download tokens (with filenames)
-        # Pick a primary language tag for the filename
         primary_lang = (req.langs.split(",")[0] or "en").strip().replace("*", "en")
         txt_filename = f"{meta_vid}_{primary_lang}.txt"
         srt_filename = f"{meta_vid}_{primary_lang}.srt"
@@ -299,7 +276,7 @@ def transcript(req: Req):
         srt_token = _store_file(srt_bytes, "text/plain; charset=utf-8", srt_filename)
         if pdf_bytes:
             pdf_token = _store_file(pdf_bytes, "application/pdf", pdf_filename)
-            pdf_http_url = f"/file/{pdf_token}"
+            pdf_http_url = _abs_url(f"/file/{pdf_token}")
 
         result = {
             "title": title,
@@ -309,17 +286,16 @@ def transcript(req: Req):
             "video_id": meta_vid,
             "preview_text": txt_text[:2500],
             "truncated": len(txt_text) > 2500,
-            "txt_http_url": f"/file/{txt_token}",
-            "srt_http_url": f"/file/{srt_token}",
+            "txt_http_url": _abs_url(f"/file/{txt_token}"),
+            "srt_http_url": _abs_url(f"/file/{srt_token}"),
             "pdf_http_url": pdf_http_url,
             "links_expire_in_seconds": FILE_TTL_SECONDS,
-            # -- DEBUG INFO --
             "debug": {
                 "extracted_video_id": vid,
-                "timedtext_probe": tt,             # status + length of XML
-                "ytdlp_attempts": attempts["attempts"],  # every command + rc + stderr
+                "timedtext_probe": tt,
+                "ytdlp_attempts": attempts["attempts"],
                 "meta_id": meta_vid,
-                "pdf_error": pdf_error,            # NEW: see why PDF would fail (if it does)
+                "pdf_error": pdf_error,
             },
         }
         return result
