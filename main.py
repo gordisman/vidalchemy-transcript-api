@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from yt_dlp import YoutubeDL
+from urllib.error import HTTPError
 
 # -----------------------------
 # Config
@@ -22,7 +23,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.7.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="2.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -158,18 +159,35 @@ def best_caption_url(tracks: List[dict]) -> Optional[str]:
 
 
 def http_fetch(url: str) -> bytes:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
+    """Fetch URL with retry/backoff on 429 errors."""
+    delays = [2, 5, 10]  # seconds
+    last_err = None
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36"
+                    )
+                },
             )
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except HTTPError as e:
+            if e.code == 429:
+                last_err = e
+                if attempt < len(delays):
+                    time.sleep(delay)
+                    continue
+            raise
+        except Exception as e:
+            last_err = e
+            break
+    if last_err:
+        raise last_err
 
 
 def vtt_to_srt_bytes(vtt: bytes) -> bytes:
