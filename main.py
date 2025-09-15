@@ -1,11 +1,10 @@
 import os
 import re
-import json
 import time
 import base64
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,13 +16,13 @@ from urllib.error import HTTPError
 # Config
 # -----------------------------
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-EXPIRES_IN_SECONDS = int(os.getenv("FILE_EXPIRES_SECONDS", "86400"))  # 24h
+EXPIRES_IN_SECONDS = int(os.getenv("FILE_EXPIRES_SECONDS", "86400"))  # default 24h
 PORT = int(os.getenv("PORT", "8000"))
 
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.9.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,7 +31,7 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Ephemeral file storage with tokens
+# Ephemeral file storage
 # -----------------------------
 FILES: Dict[str, Dict] = {}
 
@@ -78,7 +77,7 @@ def _file_url(token: str) -> str:
 # Utility
 # -----------------------------
 def pretty_duration(seconds: int) -> str:
-    if seconds <= 0:
+    if not seconds:
         return "0s"
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
@@ -104,8 +103,7 @@ def ordered_langs(user_langs: str) -> List[str]:
         return pref + ["all"]
 
     parts = [normalize_lang(p) for p in user_langs.split(",") if p.strip()]
-    seen = set()
-    out = []
+    seen, out = set(), []
     for p in parts:
         if p not in seen:
             out.append(p)
@@ -160,7 +158,7 @@ def best_caption_url(tracks: List[dict]) -> Optional[str]:
 
 def http_fetch(url: str) -> bytes:
     """Fetch URL with retry/backoff on 429 errors."""
-    delays = [2, 5, 10]  # seconds
+    delays = [2, 5, 10]
     last_err = None
     for attempt, delay in enumerate(delays, start=1):
         try:
@@ -193,12 +191,10 @@ def http_fetch(url: str) -> bytes:
 def vtt_to_srt_bytes(vtt: bytes) -> bytes:
     text = vtt.decode("utf-8", errors="ignore")
     lines = [ln for ln in text.splitlines() if not ln.strip().startswith("WEBVTT")]
-    out_lines: List[str] = []
-    idx = 1
-    buf: List[str] = []
+    out_lines, buf, idx = [], [], 1
 
     def flush():
-        nonlocal idx, buf, out_lines
+        nonlocal idx, buf
         if not buf:
             return
         head = buf[0].replace(".", ",")
@@ -209,7 +205,7 @@ def vtt_to_srt_bytes(vtt: bytes) -> bytes:
                 out_lines.append(re.sub(r"<[^>]+>", "", tline))
         out_lines.append("")
         idx += 1
-        buf = []
+        buf.clear()
 
     for ln in lines:
         if re.match(r"^\s*$", ln):
@@ -229,7 +225,7 @@ def vtt_to_srt_bytes(vtt: bytes) -> bytes:
 def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
     raw = srt_bytes.decode("utf-8", errors="ignore")
     blocks = re.split(r"\n\s*\n", raw.strip())
-    lines: List[str] = []
+    lines = []
     for blk in blocks:
         blk = re.sub(r"^\s*\d+\s*\n", "", blk)
         m = re.search(r"(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", blk)
@@ -242,8 +238,7 @@ def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
         if not text:
             continue
         if keep_ts and m:
-            ts = m.group(1)
-            lines.append(f"{ts} {text}")
+            lines.append(f"{m.group(1)} {text}")
         else:
             lines.append(text)
     out = "\n".join(lines) if keep_ts else " ".join(lines)
@@ -252,205 +247,163 @@ def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
     return out
 
 # -----------------------------
-# Caption Track Selection
+# Preview logic
 # -----------------------------
-def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str]:
-    subs = info.get("subtitles") or {}
-    autos = info.get("automatic_captions") or {}
+def build_preview(full_text: str, max_chars: int = 3000, min_sentences: int = 5, char_target: int = 800):
+    sentences = re.split(r'(?<=[.!?])\s+', full_text)
+    preview, count = "", 0
 
-    manual_langs = {normalize_lang(k): k for k in subs.keys()}
-    auto_langs = {normalize_lang(k): k for k in autos.keys()}
+    for s in sentences:
+        if not s.strip():
+            continue
+        preview += s.strip() + " "
+        count += 1
+        if count >= min_sentences and len(preview) >= char_target:
+            break
 
-    for want in pref_langs:
-        if want == "all":
-            for raw in ["en", "en-US", "en-GB"]:
-                if raw in subs:
-                    url = best_caption_url(subs.get(raw) or [])
-                    if url:
-                        return ("manual", raw, url)
-                if raw in autos:
-                    url = best_caption_url(autos.get(raw) or [])
-                    if url:
-                        return ("auto-translated", raw, url)
-            for raw in subs.keys():
-                url = best_caption_url(subs.get(raw) or [])
-                if url:
-                    return ("manual", raw, url)
-            for raw in autos.keys():
-                url = best_caption_url(autos.get(raw) or [])
-                if url:
-                    return ("auto-original", raw, url)
-        else:
-            raw = manual_langs.get(want)
-            if raw:
-                url = best_caption_url(subs.get(raw) or [])
-                if url:
-                    return ("manual", raw, url)
-            raw = auto_langs.get(want)
-            if raw:
-                url = best_caption_url(autos.get(raw) or [])
-                if url:
-                    spoken_lang = normalize_lang(info.get("language") or "")
-                    kind = "auto-original" if want == spoken_lang else "auto-translated"
-                    return (kind, raw, url)
+    if len(preview) > max_chars:
+        preview = preview[:max_chars]
 
-    raise Exception("No captions were found in requested/available languages.")
+    truncated = len(full_text) > len(preview)
+    return preview.strip(), truncated
+
+# -----------------------------
+# Caption track selection
+# -----------------------------
+def pick_caption_track(info: dict, langs: List[str]) -> Optional[dict]:
+    subs, autos = info.get("subtitles") or {}, info.get("automatic_captions") or {}
+
+    for lang in langs:
+        if lang == "all":
+            for d in (subs, autos):
+                for tracks in d.values():
+                    if tracks:
+                        return tracks[0]
+        if lang in subs and subs[lang]:
+            return subs[lang][0]
+        if lang in autos and autos[lang]:
+            return autos[lang][0]
+    return None
 
 # -----------------------------
 # Schemas
 # -----------------------------
 class Req(BaseModel):
     url_or_id: str
-    langs: str = "en,en-US,en-GB,all"
-    keep_timestamps: bool = False
+    langs: str
+    keep_timestamps: bool
 
 # -----------------------------
 # Endpoints
 # -----------------------------
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "egress_to_youtube": True,
-        "expires_in_seconds_default": EXPIRES_IN_SECONDS,
-    }
+    return {"ok": True, "egress_to_youtube": True, "expires_in_seconds_default": EXPIRES_IN_SECONDS}
 
 
 @app.get("/probe")
 def probe(url: str):
-    vid = extract_video_id(url)
-    full = f"https://www.youtube.com/watch?v={vid}" if not url.startswith("http") else url
-    info = yt_info(full)
-    manual = sorted((info.get("subtitles") or {}).keys())
-    auto = sorted((info.get("automatic_captions") or {}).keys())
+    info = yt_info(url)
     return {
         "info": {
             "title": info.get("title"),
-            "duration": info.get("duration") or 0,
-            "subtitles_keys": manual,
-            "auto_captions_keys": auto,
-        },
+            "duration": info.get("duration"),
+            "subtitles_keys": list((info.get("subtitles") or {}).keys()),
+            "auto_captions_keys": list((info.get("automatic_captions") or {}).keys()),
+        }
     }
 
 
 @app.get("/file/{token}")
-def get_file(token: str):
+def getFile(token: str):
+    _purge_expired()
     meta = FILES.get(token)
     if not meta:
-        raise HTTPException(404, "Expired or invalid file token.")
-    if meta["expires_at"] <= _now():
-        _purge_expired()
-        raise HTTPException(404, "Expired or invalid file token.")
-    p = Path(meta["path"])
-    if not p.exists():
-        _purge_expired()
-        raise HTTPException(404, "File not found.")
-
-    headers = {"Content-Disposition": f'attachment; filename="{meta["filename"]}"'}
-
-    mime = meta["mime"]
-    if meta["filename"].endswith(".srt"):
-        mime = "application/x-subrip"
-    elif meta["filename"].endswith(".pdf"):
-        mime = "application/pdf"
-    elif meta["filename"].endswith(".txt"):
-        mime = "text/plain"
-
-    return Response(p.read_bytes(), headers=headers, media_type=mime)
+        raise HTTPException(status_code=404, detail="File expired or not found")
+    path = Path(meta["path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File missing")
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(
+        content=data,
+        media_type=meta["mime"],
+        headers={"Content-Disposition": f"attachment; filename={meta['filename']}"},
+    )
 
 
 @app.post("/transcript")
-def transcript(req: Req):
-    vid = extract_video_id(req.url_or_id)
-    url = req.url_or_id if req.url_or_id.startswith("http") else f"https://www.youtube.com/watch?v={vid}"
-
+def fetchTranscript(req: Req):
     try:
-        info = yt_info(url)
-    except Exception as e:
-        return {"ok": False, "error": f"Failed to fetch metadata: {str(e)}", "available_langs": [], "tried_langs": ordered_langs(req.langs)}
+        langs = ordered_langs(req.langs)
+        info = yt_info(req.url_or_id)
+        track = pick_caption_track(info, langs)
 
-    title = info.get("title", "")
-    channel = info.get("channel") or info.get("uploader", "")
-    published_at = info.get("upload_date", "")
-    if published_at and len(published_at) == 8:
-        published_at = f"{published_at[:4]}-{published_at[4:6]}-{published_at[6:]}"
-    duration_s = int(info.get("duration") or 0)
+        if not track:
+            return {
+                "ok": False,
+                "error": "No captions found",
+                "available_langs": list((info.get("subtitles") or {}).keys()) +
+                                   list((info.get("automatic_captions") or {}).keys()),
+                "tried_langs": langs,
+            }
 
-    subs = info.get("subtitles") or {}
-    autos = info.get("automatic_captions") or {}
+        vtt_url = best_caption_url([track])
+        if not vtt_url:
+            return {"ok": False, "error": "No caption URL available"}
 
-    try:
-        pref = ordered_langs(req.langs)
-        kind, lang_raw, track_url = pick_caption_track(info, pref)
-    except Exception as e:
-        return {"ok": False, "error": str(e), "available_langs": [], "tried_langs": ordered_langs(req.langs)}
-
-    # Build filtered available_langs: English + original spoken language
-    filtered_langs = []
-    if any(k in subs or k in autos for k in ["en", "en-US", "en-GB"]):
-        filtered_langs.append("en")
-    spoken_lang = normalize_lang(info.get("language") or "")
-    if spoken_lang and (spoken_lang in subs or spoken_lang in autos):
-        filtered_langs.append(spoken_lang)
-
-    try:
-        vtt_bytes = http_fetch(track_url)
+        vtt_bytes = http_fetch(vtt_url)
         srt_bytes = vtt_to_srt_bytes(vtt_bytes)
-        text = clean_srt_text(srt_bytes, keep_ts=req.keep_timestamps)
-        text_bytes = text.encode("utf-8")
+        full_text = clean_srt_text(srt_bytes, req.keep_timestamps)
 
-        work = Path("/tmp") / f"cap_{vid}_{int(time.time())}"
-        work.mkdir(parents=True, exist_ok=True)
+        preview_text, truncated = build_preview(full_text)
 
-        srt_path = work / f"{vid}_{lang_raw}.srt"
+        # Save files
+        base = Path("/tmp")
+        txt_path, srt_path, pdf_path = base / f"{_tok()}.txt", base / f"{_tok()}.srt", base / f"{_tok()}.pdf"
+        txt_path.write_text(full_text, encoding="utf-8")
         srt_path.write_bytes(srt_bytes)
 
-        txt_path = work / f"{vid}_{lang_raw}.txt"
-        txt_path.write_bytes(text_bytes)
-
-        pdf_tok = None
+        # Try PDF
+        pdf_token = None
         try:
             from fpdf import FPDF
             pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-            try:
-                pdf.add_font("DejaVu", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", uni=True)
-                pdf.set_font("DejaVu", size=12)
-            except Exception:
-                pdf.set_font("Arial", size=12)
-
-            header = f"{title}\n{channel} · {published_at}\nhttps://www.youtube.com/watch?v={vid}\n\n"
-            for line in (header + text).split("\n"):
-                pdf.multi_cell(0, 6, line)
-            pdf_path = work / f"{vid}_{lang_raw}.pdf"
+            pdf.set_font("Arial", size=12)
+            for line in full_text.split("\n"):
+                pdf.multi_cell(0, 10, line)
             pdf.output(str(pdf_path))
-            pdf_tok = _store_file(pdf_path, "application/pdf", pdf_path.name)
-        except Exception as e:
-            print(f"PDF generation failed: {e}")
+            pdf_token = _store_file(pdf_path, "application/pdf", "transcript.pdf")
+        except Exception:
+            pdf_token = None
 
-        srt_tok = _store_file(srt_path, "application/x-subrip", srt_path.name)
-        txt_tok = _store_file(txt_path, "text/plain", txt_path.name)
+        txt_token = _store_file(txt_path, "text/plain", "transcript.txt")
+        srt_token = _store_file(srt_path, "application/x-subrip", "transcript.srt")
 
         return {
             "ok": True,
-            "title": title,
-            "channel": channel,
-            "published_at": published_at,
-            "duration_s": duration_s,
-            "duration_pretty": pretty_duration(duration_s),
-            "video_id": vid,
-            "captions_kind": kind,
-            "captions_lang": lang_raw,
-            "preview_text": text[:3000],
-            "truncated": len(text) > 3000,
-            "txt_http_url": _file_url(txt_tok),
-            "srt_http_url": _file_url(srt_tok),
-            "pdf_http_url": _file_url(pdf_tok) if pdf_tok else "",
+            "title": info.get("title"),
+            "channel": info.get("uploader"),
+            "published_at": info.get("upload_date"),
+            "duration_s": info.get("duration"),
+            "duration_pretty": pretty_duration(info.get("duration", 0)),
+            "video_id": extract_video_id(req.url_or_id),
+            "captions_kind": "manual" if track in sum(info.get("subtitles", {}).values(), []) else "auto",
+            "captions_lang": track.get("lang", "unknown"),
+            "preview_text": preview_text,
+            "truncated": truncated,
+            "txt_http_url": _file_url(txt_token),
+            "srt_http_url": _file_url(srt_token),
+            "pdf_http_url": _file_url(pdf_token) if pdf_token else None,
             "links_expire_in_seconds": EXPIRES_IN_SECONDS,
-            "links_expire_human": f"{EXPIRES_IN_SECONDS//3600}h",
-            "available_langs": filtered_langs,
+            "links_expire_human": f"{EXPIRES_IN_SECONDS // 3600}h",
         }
 
     except Exception as e:
-        return {"ok": False, "error": f"Failed while processing captions: {str(e)}", "available_langs": filtered_langs, "tried_langs": ordered_langs(req.langs)}
+        return {
+            "ok": False,
+            "error": f"Failed while processing captions: {str(e)}",
+            "available_langs": [],
+            "tried_langs": ordered_langs(req.langs),
+        }
