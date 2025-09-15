@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="3.0.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -223,8 +223,10 @@ def vtt_to_srt_bytes(vtt: bytes) -> bytes:
 
 
 def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
-    raw = srt_bytes.decode("utf-8", errors="ignore")
-    blocks = re.split(r"\n\s*\n", raw.strip())
+    raw = srt_bytes.decode("utf-8", errors="ignore").strip()
+    if not raw:
+        return ""
+    blocks = re.split(r"\n\s*\n", raw)
     lines = []
     for blk in blocks:
         blk = re.sub(r"^\s*\d+\s*\n", "", blk)
@@ -354,7 +356,13 @@ def fetchTranscript(req: Req):
 
         vtt_bytes = http_fetch(vtt_url)
         srt_bytes = vtt_to_srt_bytes(vtt_bytes)
+
+        if not srt_bytes.strip():
+            return {"ok": False, "error": "No usable captions found"}
+
         full_text = clean_srt_text(srt_bytes, req.keep_timestamps)
+        if not full_text.strip():
+            return {"ok": False, "error": "No usable captions found"}
 
         preview_text, truncated = build_preview(full_text)
 
