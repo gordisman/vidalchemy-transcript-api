@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.6.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="2.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -245,7 +245,6 @@ def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str
 
     for want in pref_langs:
         if want == "all":
-            # Prefer English first if available
             for raw in ["en", "en-US", "en-GB"]:
                 if raw in subs:
                     url = best_caption_url(subs.get(raw) or [])
@@ -254,20 +253,14 @@ def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str
                 if raw in autos:
                     url = best_caption_url(autos.get(raw) or [])
                     if url:
-                        # Distinguish auto-translated vs original
                         return ("auto-translated", raw, url)
-
-            # Otherwise, first available manual
             for raw in subs.keys():
                 url = best_caption_url(subs.get(raw) or [])
                 if url:
                     return ("manual", raw, url)
-
-            # Otherwise, first available auto
             for raw in autos.keys():
                 url = best_caption_url(autos.get(raw) or [])
                 if url:
-                    # Assume this is the original spoken language auto-generated
                     return ("auto-original", raw, url)
         else:
             raw = manual_langs.get(want)
@@ -279,8 +272,6 @@ def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str
             if raw:
                 url = best_caption_url(autos.get(raw) or [])
                 if url:
-                    # If the requested language is the spoken/original → auto-original
-                    # Otherwise, treat as auto-translated
                     spoken_lang = normalize_lang(info.get("language") or "")
                     kind = "auto-original" if want == spoken_lang else "auto-translated"
                     return (kind, raw, url)
@@ -369,13 +360,20 @@ def transcript(req: Req):
 
     subs = info.get("subtitles") or {}
     autos = info.get("automatic_captions") or {}
-    available_langs = sorted(set(list(subs.keys()) + list(autos.keys())))
 
     try:
         pref = ordered_langs(req.langs)
         kind, lang_raw, track_url = pick_caption_track(info, pref)
     except Exception as e:
-        return {"ok": False, "error": str(e), "available_langs": available_langs, "tried_langs": ordered_langs(req.langs)}
+        return {"ok": False, "error": str(e), "available_langs": [], "tried_langs": ordered_langs(req.langs)}
+
+    # Build filtered available_langs: English + original spoken language
+    filtered_langs = []
+    if any(k in subs or k in autos for k in ["en", "en-US", "en-GB"]):
+        filtered_langs.append("en")
+    spoken_lang = normalize_lang(info.get("language") or "")
+    if spoken_lang and (spoken_lang in subs or spoken_lang in autos):
+        filtered_langs.append(spoken_lang)
 
     try:
         vtt_bytes = http_fetch(track_url)
@@ -433,8 +431,8 @@ def transcript(req: Req):
             "pdf_http_url": _file_url(pdf_tok) if pdf_tok else "",
             "links_expire_in_seconds": EXPIRES_IN_SECONDS,
             "links_expire_human": f"{EXPIRES_IN_SECONDS//3600}h",
-            "available_langs": available_langs,
+            "available_langs": filtered_langs,
         }
 
     except Exception as e:
-        return {"ok": False, "error": f"Failed while processing captions: {str(e)}", "available_langs": available_langs, "tried_langs": ordered_langs(req.langs)}
+        return {"ok": False, "error": f"Failed while processing captions: {str(e)}", "available_langs": filtered_langs, "tried_langs": ordered_langs(req.langs)}
