@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.5.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="2.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -145,52 +145,6 @@ def yt_info(url: str) -> dict:
     return info
 
 
-def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str]:
-    subs = info.get("subtitles") or {}
-    autos = info.get("automatic_captions") or {}
-
-    manual_langs = {normalize_lang(k): k for k in subs.keys()}
-    auto_langs = {normalize_lang(k): k for k in autos.keys()}
-
-    for want in pref_langs:
-        if want == "all":
-            # Prefer English first if it exists
-            for raw in ["en", "en-US", "en-GB"]:
-                if raw in subs:
-                    url = best_caption_url(subs.get(raw) or [])
-                    if url:
-                        return ("manual", raw, url)
-                if raw in autos:
-                    url = best_caption_url(autos.get(raw) or [])
-                    if url:
-                        return ("auto", raw, url)
-
-            # Otherwise, take the first manual caption available
-            for raw in subs.keys():
-                url = best_caption_url(subs.get(raw) or [])
-                if url:
-                    return ("manual", raw, url)
-
-            # If no manual, take the first auto caption available
-            for raw in autos.keys():
-                url = best_caption_url(autos.get(raw) or [])
-                if url:
-                    return ("auto", raw, url)
-        else:
-            raw = manual_langs.get(want)
-            if raw:
-                url = best_caption_url(subs.get(raw) or [])
-                if url:
-                    return ("manual", raw, url)
-            raw = auto_langs.get(want)
-            if raw:
-                url = best_caption_url(autos.get(raw) or [])
-                if url:
-                    return ("auto", raw, url)
-
-    raise Exception("No captions were found in requested/available languages.")
-
-
 def best_caption_url(tracks: List[dict]) -> Optional[str]:
     if not tracks:
         return None
@@ -278,6 +232,60 @@ def clean_srt_text(srt_bytes: bytes, keep_ts: bool) -> str:
     out = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", out, flags=re.IGNORECASE)
     out = re.sub(r"\s+([,.;:!?])", r"\1", out)
     return out
+
+# -----------------------------
+# Caption Track Selection
+# -----------------------------
+def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str]:
+    subs = info.get("subtitles") or {}
+    autos = info.get("automatic_captions") or {}
+
+    manual_langs = {normalize_lang(k): k for k in subs.keys()}
+    auto_langs = {normalize_lang(k): k for k in autos.keys()}
+
+    for want in pref_langs:
+        if want == "all":
+            # Prefer English first if available
+            for raw in ["en", "en-US", "en-GB"]:
+                if raw in subs:
+                    url = best_caption_url(subs.get(raw) or [])
+                    if url:
+                        return ("manual", raw, url)
+                if raw in autos:
+                    url = best_caption_url(autos.get(raw) or [])
+                    if url:
+                        # Distinguish auto-translated vs original
+                        return ("auto-translated", raw, url)
+
+            # Otherwise, first available manual
+            for raw in subs.keys():
+                url = best_caption_url(subs.get(raw) or [])
+                if url:
+                    return ("manual", raw, url)
+
+            # Otherwise, first available auto
+            for raw in autos.keys():
+                url = best_caption_url(autos.get(raw) or [])
+                if url:
+                    # Assume this is the original spoken language auto-generated
+                    return ("auto-original", raw, url)
+        else:
+            raw = manual_langs.get(want)
+            if raw:
+                url = best_caption_url(subs.get(raw) or [])
+                if url:
+                    return ("manual", raw, url)
+            raw = auto_langs.get(want)
+            if raw:
+                url = best_caption_url(autos.get(raw) or [])
+                if url:
+                    # If the requested language is the spoken/original → auto-original
+                    # Otherwise, treat as auto-translated
+                    spoken_lang = normalize_lang(info.get("language") or "")
+                    kind = "auto-original" if want == spoken_lang else "auto-translated"
+                    return (kind, raw, url)
+
+    raise Exception("No captions were found in requested/available languages.")
 
 # -----------------------------
 # Schemas
@@ -391,11 +399,9 @@ def transcript(req: Req):
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
             try:
-                # Use a Unicode-safe font if available
                 pdf.add_font("DejaVu", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", uni=True)
                 pdf.set_font("DejaVu", size=12)
             except Exception:
-                # Fallback to built-in Arial
                 pdf.set_font("Arial", size=12)
 
             header = f"{title}\n{channel} · {published_at}\nhttps://www.youtube.com/watch?v={vid}\n\n"
@@ -427,6 +433,7 @@ def transcript(req: Req):
             "pdf_http_url": _file_url(pdf_tok) if pdf_tok else "",
             "links_expire_in_seconds": EXPIRES_IN_SECONDS,
             "links_expire_human": f"{EXPIRES_IN_SECONDS//3600}h",
+            "available_langs": available_langs,
         }
 
     except Exception as e:
