@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.3.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="2.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,7 +33,7 @@ app.add_middleware(
 # -----------------------------
 # Ephemeral file storage with tokens
 # -----------------------------
-FILES: Dict[str, Dict] = {}  # token -> {path, mime, filename, expires_at}
+FILES: Dict[str, Dict] = {}
 
 
 def _tok() -> str:
@@ -89,12 +89,6 @@ def pretty_duration(seconds: int) -> str:
 
 
 def normalize_lang(code: str) -> str:
-    """
-    Normalize YouTube caption codes:
-    - Lowercase
-    - Strip region suffixes (nl-NL -> nl, es-419 -> es)
-    - Remove "-orig"
-    """
     code = code.strip().lower()
     if "-" in code:
         code = code.split("-")[0]
@@ -326,10 +320,8 @@ def get_file(token: str):
         _purge_expired()
         raise HTTPException(404, "File not found.")
 
-    # Force download with correct filename and MIME type
     headers = {"Content-Disposition": f'attachment; filename="{meta["filename"]}"'}
 
-    # Ensure correct MIME types
     mime = meta["mime"]
     if meta["filename"].endswith(".srt"):
         mime = "application/x-subrip"
@@ -349,12 +341,7 @@ def transcript(req: Req):
     try:
         info = yt_info(url)
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"Failed to fetch metadata: {str(e)}",
-            "available_langs": [],
-            "tried_langs": ordered_langs(req.langs),
-        }
+        return {"ok": False, "error": f"Failed to fetch metadata: {str(e)}", "available_langs": [], "tried_langs": ordered_langs(req.langs)}
 
     title = info.get("title", "")
     channel = info.get("channel") or info.get("uploader", "")
@@ -371,12 +358,7 @@ def transcript(req: Req):
         pref = ordered_langs(req.langs)
         kind, lang_raw, track_url = pick_caption_track(info, pref)
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "available_langs": available_langs,
-            "tried_langs": ordered_langs(req.langs),
-        }
+        return {"ok": False, "error": str(e), "available_langs": available_langs, "tried_langs": ordered_langs(req.langs)}
 
     try:
         vtt_bytes = http_fetch(track_url)
@@ -393,25 +375,31 @@ def transcript(req: Req):
         txt_path = work / f"{vid}_{lang_raw}.txt"
         txt_path.write_bytes(text_bytes)
 
-        pdf_path = work / f"{vid}_{lang_raw}.pdf"
-        pdf_bytes = None
+        pdf_tok = None
         try:
             from fpdf import FPDF
             pdf = FPDF()
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-            pdf.set_font("Arial", size=12)
+            try:
+                # Use a Unicode-safe font if available
+                pdf.add_font("DejaVu", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", uni=True)
+                pdf.set_font("DejaVu", size=12)
+            except Exception:
+                # Fallback to built-in Arial
+                pdf.set_font("Arial", size=12)
+
             header = f"{title}\n{channel} · {published_at}\nhttps://www.youtube.com/watch?v={vid}\n\n"
             for line in (header + text).split("\n"):
                 pdf.multi_cell(0, 6, line)
+            pdf_path = work / f"{vid}_{lang_raw}.pdf"
             pdf.output(str(pdf_path))
-            pdf_bytes = pdf_path.read_bytes()
-        except Exception:
-            pdf_bytes = None
+            pdf_tok = _store_file(pdf_path, "application/pdf", pdf_path.name)
+        except Exception as e:
+            print(f"PDF generation failed: {e}")
 
         srt_tok = _store_file(srt_path, "application/x-subrip", srt_path.name)
         txt_tok = _store_file(txt_path, "text/plain", txt_path.name)
-        pdf_tok = _store_file(pdf_path, "application/pdf", pdf_path.name) if pdf_bytes else None
 
         return {
             "ok": True,
@@ -433,9 +421,4 @@ def transcript(req: Req):
         }
 
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"Failed while processing captions: {str(e)}",
-            "available_langs": available_langs,
-            "tried_langs": ordered_langs(req.langs),
-        }
+        return {"ok": False, "error": f"Failed while processing captions: {str(e)}", "available_langs": available_langs, "tried_langs": ordered_langs(req.langs)}
