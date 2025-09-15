@@ -22,7 +22,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Creator Transcript Fetcher", version="2.4.0")
+app = FastAPI(title="Creator Transcript Fetcher", version="2.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -154,11 +154,25 @@ def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str
 
     for want in pref_langs:
         if want == "all":
-            for raw in manual_langs.values():
+            # Prefer English first if it exists
+            for raw in ["en", "en-US", "en-GB"]:
+                if raw in subs:
+                    url = best_caption_url(subs.get(raw) or [])
+                    if url:
+                        return ("manual", raw, url)
+                if raw in autos:
+                    url = best_caption_url(autos.get(raw) or [])
+                    if url:
+                        return ("auto", raw, url)
+
+            # Otherwise, take the first manual caption available
+            for raw in subs.keys():
                 url = best_caption_url(subs.get(raw) or [])
                 if url:
                     return ("manual", raw, url)
-            for raw in auto_langs.values():
+
+            # If no manual, take the first auto caption available
+            for raw in autos.keys():
                 url = best_caption_url(autos.get(raw) or [])
                 if url:
                     return ("auto", raw, url)
@@ -173,11 +187,6 @@ def pick_caption_track(info: dict, pref_langs: List[str]) -> Tuple[str, str, str
                 url = best_caption_url(autos.get(raw) or [])
                 if url:
                     return ("auto", raw, url)
-
-    for raw in auto_langs.values():
-        url = best_caption_url(autos.get(raw) or [])
-        if url:
-            return ("auto", raw, url)
 
     raise Exception("No captions were found in requested/available languages.")
 
